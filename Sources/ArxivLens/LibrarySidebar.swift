@@ -14,9 +14,26 @@ private enum SearchMode: String, CaseIterable {
     case natural = "自然语言"
 }
 
-private struct LibrarySection: Identifiable {
-    let id: String
+private struct LibrarySection {
+    let title: String
     let entries: [Paper.HistoryEntry]
+}
+
+private enum LibraryListItem: Identifiable {
+    enum ID: Hashable {
+        case heading(String)
+        case paper(String)
+    }
+
+    case heading(String, count: Int)
+    case paper(Paper.HistoryEntry)
+
+    var id: ID {
+        switch self {
+        case .heading(let title, _): return .heading(title)
+        case .paper(let entry): return .paper(entry.id)
+        }
+    }
 }
 
 struct LibrarySidebar: View {
@@ -42,23 +59,28 @@ struct LibrarySidebar: View {
             libraryControls
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 5) {
-                    let sections = sections()
-                    ForEach(sections) { section in
-                        if !section.id.isEmpty {
+                    let items = listItems()
+                    ForEach(items) { item in
+                        switch item {
+                        case .heading(let title, let count):
                             HStack {
-                                Text(section.id).lineLimit(1)
+                                Text(title).lineLimit(1)
                                 Spacer()
-                                Text("\(section.entries.count)").monospacedDigit()
+                                Text("\(count)").monospacedDigit()
                             }
                             .font(.system(size: 10, weight: .semibold)).foregroundStyle(Palette.soft)
                             .padding(.horizontal, 8).padding(.top, 8).padding(.bottom, 2)
+                        case .paper(let entry):
+                            row(entry)
                         }
-                        ForEach(section.entries) { entry in row(entry) }
                     }
-                    if sections.isEmpty { emptyState }
+                    if items.isEmpty { emptyState }
                 }
                 .padding(.horizontal, 12)
             }
+            // A different grouping builds a new scroll layout and hit map,
+            // while the selected document remains in the shared store.
+            .id(grouping)
             Button { store.settingsOpen = true } label: {
                 Label("翻译与 TeX 设置", systemImage: "gearshape")
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.soft)
@@ -176,11 +198,19 @@ struct LibrarySidebar: View {
         .padding(.bottom, 7)
     }
 
+    private func listItems() -> [LibraryListItem] {
+        sections().flatMap { section in
+            let entries = section.entries.map(LibraryListItem.paper)
+            if section.title.isEmpty { return entries }
+            return [.heading(section.title, count: entries.count)] + entries
+        }
+    }
+
     private func sections() -> [LibrarySection] {
         if mode == .natural, let hits {
             let byID = Dictionary(uniqueKeysWithValues: history.map { ($0.id, $0) })
             let results = hits.compactMap { byID[$0.id] }
-            return results.isEmpty ? [] : [LibrarySection(id: "检索结果", entries: results)]
+            return results.isEmpty ? [] : [LibrarySection(title: "检索结果", entries: results)]
         }
         let filtered = mode == .natural || terms.isEmpty ? history : history.filter { entry in
             let classification = catalog.entries[entry.id]
@@ -189,7 +219,7 @@ struct LibrarySidebar: View {
             return terms.allSatisfy { term in searchable.contains { $0.localizedCaseInsensitiveContains(term) } }
         }
         guard !filtered.isEmpty else { return [] }
-        if grouping == .recent { return [LibrarySection(id: "", entries: filtered)] }
+        if grouping == .recent { return [LibrarySection(title: "", entries: filtered)] }
         let grouped = Dictionary(grouping: filtered) { entry -> String in
             let classification = catalog.entries[entry.id]
             switch grouping {
@@ -207,7 +237,7 @@ struct LibrarySidebar: View {
         }
         return keys.compactMap { name in
             grouped[name].map { records in
-                LibrarySection(id: name, entries: grouping == .alphabet ? records.sorted {
+                LibrarySection(title: name, entries: grouping == .alphabet ? records.sorted {
                     $0.latest.title.localizedStandardCompare($1.latest.title) == .orderedAscending
                 } : records)
             }
@@ -250,11 +280,13 @@ struct LibrarySidebar: View {
                 }
                 Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
             .background(active ? Palette.teal.opacity(0.65) : .clear, in: RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
+            .contentShape(.interaction, Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? .isSelected : [])
         .help(paper.title)
         .contextMenu {
             Button(paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文") {
