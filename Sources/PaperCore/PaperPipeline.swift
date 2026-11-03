@@ -3,22 +3,30 @@ import Foundation
 import PDFKit
 
 public enum PaperPipeline {
+    public struct CompileFailure: LocalizedError, Sendable {
+        public let message: String
+        public let logURL: URL?
+        public var errorDescription: String? { message }
+    }
+
     public static func run(
-        input: String, settings: TranslationSettings, originalReady: @Sendable (Paper) async -> Void = { _ in },
+        input: String, settings: TranslationSettings, savedPaper: Paper? = nil,
+        originalReady: @Sendable (Paper) async -> Void = { _ in },
         report: @Sendable (JobProgress) async -> Void
     ) async throws -> Paper {
-        try await run(input: input, settings: settings, support: Paper.support,
+        try await run(input: input, settings: settings, support: Paper.support, savedPaper: savedPaper,
                       originalReady: originalReady, report: report)
     }
 
     public static func download(
-        input: String, report: @Sendable (JobProgress) async -> Void
+        input: String, originalReady: @Sendable (Paper) async -> Void = { _ in },
+        report: @Sendable (JobProgress) async -> Void
     ) async throws -> Paper {
-        try await run(input: input, settings: nil, support: Paper.support, report: report)
+        try await run(input: input, settings: nil, support: Paper.support, originalReady: originalReady, report: report)
     }
 
     static func run(
-        input: String, settings: TranslationSettings?, support: URL,
+        input: String, settings: TranslationSettings?, support: URL, savedPaper: Paper? = nil,
         originalReady: @Sendable (Paper) async -> Void = { _ in },
         report: @Sendable (JobProgress) async -> Void
     ) async throws -> Paper {
@@ -27,17 +35,17 @@ public enum PaperPipeline {
         let history = Paper.history(in: support)
         // An explicit version identifies the exact PDF already in the library.
         // For a link without a version, resolve the current version first.
-        let saved = requested.isVersioned ? history.first { $0.arxivID == requested.value } : nil
+        let pinned = savedPaper.flatMap { paper in
+            history.first { $0.id == paper.id && $0.arxivID == requested.value }
+        }
+        let saved = pinned ?? (requested.isVersioned ? history.first { $0.arxivID == requested.value } : nil)
         await report(JobProgress("连接 arXiv", "识别论文标题与版本", 0.05))
         let metadata = if let saved { (id: requested, title: Optional(saved.title), details: saved.metadata) }
             else { await ArxivDownload.metadata(requested) }
         let arxiv = metadata.id
         try Task.checkCancellation()
-        let cached = saved ?? (arxiv.isVersioned ? history.first { $0.arxivID == arxiv.value } : nil)
-        if settings == nil, let cached {
-            await report(JobProgress("已在文献库", cached.title, 1))
-            return cached
-        }
+        let editions = arxiv.isVersioned || pinned != nil ? history.filter { $0.arxivID == arxiv.value } : []
+        let cached = saved ?? editions.first
 
         let id = UUID()
         let workspace = support.appendingPathComponent("Jobs/\(id.uuidString)", isDirectory: true)
@@ -46,49 +54,62 @@ public enum PaperPipeline {
         try fm.createDirectory(at: result, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: workspace) }
 
-        if let cached {
-            try fm.copyItem(at: cached.directory(in: support).appendingPathComponent("original.pdf"), to: original)
-        } else {
-            await report(JobProgress("下载原版 PDF", metadata.title ?? arxiv.value, 0.13))
-            try await ArxivDownload.fetch(arxiv.url("pdf"), to: original)
-        }
-        guard let originalPDF = PDFDocument(url: original), originalPDF.pageCount > 0 else {
-            throw LensError("arXiv 返回的文件无法作为 PDF 打开。")
-        }
-        let pdfTitle = (originalPDF.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallbackTitle = pdfTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "arXiv \(arxiv.value)"
-
         let originalPaper: Paper
         if let cached {
             originalPaper = cached
         } else {
-            // Commit the validated download independently of the translation job.
-            let originalResult = settings == nil ? result : workspace.appendingPathComponent("download")
-            if settings != nil {
-                try fm.createDirectory(at: originalResult, withIntermediateDirectories: false)
-                try fm.copyItem(at: original, to: originalResult.appendingPathComponent("original.pdf"))
+            let download = workspace.appendingPathComponent("download", isDirectory: true)
+            try fm.createDirectory(at: download, withIntermediateDirectories: false)
+            let pdf = download.appendingPathComponent("original.pdf")
+            await report(JobProgress("下载原版 PDF", metadata.title ?? arxiv.value, 0.13))
+            try await ArxivDownload.fetch(arxiv.url("pdf"), to: pdf)
+            guard let document = PDFDocument(url: pdf), document.pageCount > 0 else {
+                throw LensError("arXiv 返回的文件无法作为 PDF 打开。")
             }
+            let pdfTitle = (document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallbackTitle = pdfTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "arXiv \(arxiv.value)"
             originalPaper = Paper(id: UUID(), arxivID: arxiv.value, title: metadata.title ?? fallbackTitle,
                                   completedAt: .now, untranslated: 0, downloadOnly: true, metadata: metadata.details)
-            try publish(originalPaper, from: originalResult, in: support)
-        }
-        guard let settings else {
-            await report(JobProgress("原文已加入文献库", originalPaper.title, 1))
-            return originalPaper
+            try publish(originalPaper, from: download, in: support)
         }
         await originalReady(originalPaper)
         try Task.checkCancellation()
 
-        await report(JobProgress("检查本机 TeX", "确认 XeLaTeX、latexmk 和中文排版组件", 0.18))
+        let storedSource = ([originalPaper] + editions).map { $0.originalSource(in: support) }
+            .first { fm.fileExists(atPath: $0.path) }
+        let originalSource: URL
+        if let storedSource {
+            originalSource = storedSource
+            await report(JobProgress("复用本机 TeX 源码", arxiv.value, 0.23))
+        } else {
+            await report(JobProgress("下载 TeX 源码", arxiv.value, 0.2))
+            let archive = workspace.appendingPathComponent("arxiv-source")
+            let extracted = workspace.appendingPathComponent("original-source", isDirectory: true)
+            try await ArxivDownload.fetch(arxiv.url("src"), to: archive)
+            try await SourceArchive.extract(archive, to: extracted, workspace: workspace)
+            originalSource = originalPaper.originalSource(in: support)
+            // Publish only after extraction has completed. Parallel readers see
+            // either no source or a complete original source tree.
+            do { try fm.moveItem(at: extracted, to: originalSource) }
+            catch {
+                guard fm.fileExists(atPath: originalSource.path) else { throw error }
+            }
+        }
+
+        guard let settings else {
+            await report(JobProgress("原文与源码已保存", originalPaper.title, 1))
+            return originalPaper
+        }
+        try Task.checkCancellation()
+
+        await report(JobProgress("检查本机 TeX", "确认 XeLaTeX、latexmk 和中文排版组件", 0.25))
         let bin = URL(fileURLWithPath: try await LocalTeX.check(settings.texPath), isDirectory: true)
-        let archive = workspace.appendingPathComponent("arxiv-source")
         let source = result.appendingPathComponent("source", isDirectory: true)
-        await report(JobProgress("下载 TeX 源码", arxiv.value, 0.23))
-        try await ArxivDownload.fetch(arxiv.url("src"), to: archive)
-        try await SourceArchive.extract(archive, to: source, workspace: workspace)
+        try fm.copyItem(at: originalPaper.directory(in: support).appendingPathComponent("original.pdf"), to: original)
+        try fm.copyItem(at: originalSource, to: source)
         let project = try TeXProject.read(from: source)
-        let title = metadata.title ?? project.title ?? fallbackTitle
+        let title = metadata.title ?? project.title ?? originalPaper.title
 
         let count = project.drafts.reduce(0) { $0 + $1.units.count }
         guard count > 0 else { throw LensError("没有找到可以翻译的 LaTeX 正文。") }
@@ -97,6 +118,7 @@ public enum PaperPipeline {
         var untranslated = 0
         var context = ""
         var cache: [String: String] = [:]
+        let font = NSFont(name: "Songti SC", size: 12) != nil ? "Songti SC" : "Heiti SC"
         for draft in project.drafts {
             var start = 0
             var translations: [String?] = []
@@ -152,7 +174,6 @@ public enum PaperPipeline {
                 completed += units.count
                 start = end
             }
-            let font = NSFont(name: "Songti SC", size: 12) != nil ? "Songti SC" : "Heiti SC"
             try draft.write(translations, font: font, lineSpacing: settings.lineSpacing)
         }
         guard untranslated < count else { throw LensError("模型未返回可用的中文译文。请检查模型和接口。") }
@@ -165,11 +186,12 @@ public enum PaperPipeline {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            // Keep the last failure log after the temporary job directory goes away.
-            let failure = support.appendingPathComponent("LastCompile.log")
-            try? fm.removeItem(at: failure)
-            try? fm.copyItem(at: log, to: failure)
-            throw error
+            let logs = support.appendingPathComponent("CompileLogs", isDirectory: true)
+            let failure = logs.appendingPathComponent(id.uuidString + ".log")
+            try? fm.createDirectory(at: logs, withIntermediateDirectories: true)
+            try? fm.moveItem(at: log, to: failure)
+            throw CompileFailure(message: error.localizedDescription,
+                                 logURL: fm.fileExists(atPath: failure.path) ? failure : nil)
         }
         guard let translatedPDF = PDFDocument(url: compiled), translatedPDF.pageCount > 0 else {
             throw LensError("XeLaTeX 没有生成可读的 PDF。")
@@ -257,7 +279,7 @@ enum ArxivDownload {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if url.path.hasPrefix("/src/") {
-                throw LensError("arXiv TeX 源码下载失败（HTTP \(status)）。请确认该版本提供源码，也可以仅下载原版 PDF。")
+                throw LensError("arXiv TeX 源码下载失败（HTTP \(status)）。请确认该版本提供源码。")
             }
             throw LensError("arXiv PDF 下载失败（HTTP \(status)）。请确认论文版本可访问。")
         }

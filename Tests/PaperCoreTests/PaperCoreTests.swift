@@ -278,42 +278,42 @@ struct PaperCoreTests {
         let support = try temp()
         defer { try? FileManager.default.removeItem(at: support) }
         let ids = environment["ARXIV_LENS_TEST_PAPERS"]?.split(separator: ",").map(String.init) ?? ["1706.03762"]
+        async let companion = downloadCompanion(environment["ARXIV_LENS_TEST_PARALLEL_PAPER"], support: support)
         for id in ids {
-            let rejecting = try TranslationSettings(url: mock, model: "fixture-reject-translation", key: "")
-            do {
-                _ = try await PaperPipeline.run(input: id, settings: rejecting, support: support, originalReady: { original in
-                    expectTrue(!original.hasTranslation)
-                    expectTrue(Paper.history(in: support).contains(original))
-                }) { _ in }
-                preconditionFailure("Expected the mock translation API to fail")
-            } catch {
-                expectTrue(error.localizedDescription.contains("HTTP 401"))
-            }
-            let requested = try ArxivID(id)
-            let retained = Paper.history(in: support).filter { $0.paperID == requested.paperID }
-            expectEqual(retained.count, 1)
-            let savedOriginal = try unwrap(retained.first)
-            expectTrue(!savedOriginal.hasTranslation)
-            let savedPDF = try unwrap(PDFDocument(url: savedOriginal.directory(in: support).appendingPathComponent("original.pdf")))
-            expectGreaterThan(savedPDF.pageCount, 0)
-            print("VERIFIED original PDF retained after failed translation \(savedOriginal.arxivID)")
-
-            let download = try await PaperPipeline.run(input: savedOriginal.arxivID, settings: nil, support: support) { progress in
+            let download = try await PaperPipeline.run(input: id, settings: nil, support: support, originalReady: { original in
+                expectTrue(Paper.history(in: support).contains(original))
+            }) { progress in
                 print("\(progress.title) \(progress.detail)")
             }
             let downloadedFolder = download.directory(in: support)
             let downloadedPDF = downloadedFolder.appendingPathComponent("original.pdf")
+            let originalSource = download.originalSource(in: support)
+            let originalRoot = try TeXProject.read(from: originalSource).root
+            let originalTeX = try Data(contentsOf: originalRoot)
             expectTrue(!download.hasTranslation)
             expectTrue(FileManager.default.fileExists(atPath: downloadedPDF.path))
             expectTrue(!FileManager.default.fileExists(atPath: downloadedFolder.appendingPathComponent("source").path))
             expectTrue(!FileManager.default.fileExists(atPath: downloadedFolder.appendingPathComponent("chinese.pdf").path))
-            expectTrue(Paper.history(in: support).contains(download))
-            if try ArxivID(download.arxivID).isVersioned {
-                expectEqual(download, savedOriginal)
-            }
-            print("VERIFIED download-only record \(download.arxivID)")
+            print("VERIFIED download-only record stores original TeX \(download.arxivID)")
 
-            let paper = try await PaperPipeline.run(input: download.arxivID, settings: settings, support: support) { progress in
+            let rejecting = try TranslationSettings(url: mock, model: "fixture-reject-translation", key: "")
+            do {
+                _ = try await PaperPipeline.run(input: download.arxivID, settings: rejecting, support: support,
+                                                savedPaper: download, originalReady: { original in
+                    expectEqual(original, download)
+                }) { progress in expectTrue(progress.title != "下载 TeX 源码") }
+                preconditionFailure("Expected the mock translation API to fail")
+            } catch {
+                expectTrue(error.localizedDescription.contains("HTTP 401"))
+            }
+            expectEqual(Paper.history(in: support).filter { $0.paperID == download.paperID }, [download])
+            let savedPDF = try unwrap(PDFDocument(url: downloadedPDF))
+            expectGreaterThan(savedPDF.pageCount, 0)
+            print("VERIFIED original PDF and TeX retained after failed translation \(download.arxivID)")
+
+            let paper = try await PaperPipeline.run(input: download.arxivID, settings: settings, support: support,
+                                                   savedPaper: download) { progress in
+                expectTrue(progress.title != "下载 TeX 源码")
                 print("\(progress.title) \(progress.detail)")
             }
             let folder = support.appendingPathComponent("Papers/\(paper.id.uuidString)")
@@ -332,13 +332,17 @@ struct PaperCoreTests {
             expectTrue(!String(decoding: legacyJSON, as: UTF8.self).contains("downloadOnly"))
             expectTrue(Paper.history(in: support).contains(persisted))
             print("VERIFIED \(paper.arxivID) \(paper.title) · pages \(original.pageCount) → \(chinese.pageCount)")
-            let retranslated = try await PaperPipeline.run(input: paper.arxivID, settings: settings, support: support) { _ in }
+            let retranslated = try await PaperPipeline.run(input: paper.arxivID, settings: settings, support: support,
+                                                          savedPaper: paper) { progress in
+                expectTrue(progress.title != "下载 TeX 源码")
+            }
             expectTrue(retranslated.id != paper.id && retranslated.hasTranslation)
             expectEqual(retranslated.arxivID, paper.arxivID)
             let group = Paper.groupedHistory(Paper.history(in: support)).first { $0.id == paper.paperID }
             expectEqual(group?.latest.id, retranslated.id)
             expectTrue(group?.translations.contains(paper) == true)
-            print("VERIFIED same-version retranslation preserves the previous edition")
+            expectEqual(try Data(contentsOf: originalRoot), originalTeX)
+            print("VERIFIED translations reuse the cached source and leave it unchanged")
 
             if let output = environment["ARXIV_LENS_TEST_COPY_TO"] {
                 let destination = URL(fileURLWithPath: output, isDirectory: true)
@@ -346,6 +350,16 @@ struct PaperCoreTests {
                 try FileManager.default.copyItem(at: folder, to: destination.appendingPathComponent(paper.id.uuidString))
             }
         }
+        if let companion = try await companion {
+            expectTrue(Paper.history(in: support).contains(companion))
+            expectTrue(FileManager.default.fileExists(atPath: companion.originalSource(in: support).path))
+            print("VERIFIED parallel download retained its PDF and source \(companion.arxivID)")
+        }
+    }
+
+    private func downloadCompanion(_ id: String?, support: URL) async throws -> Paper? {
+        guard let id else { return nil }
+        return try await PaperPipeline.run(input: id, settings: nil, support: support) { _ in }
     }
 
     private func testLegacyCJKWithXeLaTeX() async throws {

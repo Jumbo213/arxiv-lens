@@ -17,6 +17,7 @@ struct WorkspaceView: View {
     @ObservedObject var store: LibraryStore
     @AppStorage("compactReader") private var compactReader = true
     @FocusState private var linkFocused: Bool
+    @ViewState private var jobsOpen = false
 
     private var history: [Paper.HistoryEntry] { Paper.groupedHistory(store.papers) }
 
@@ -29,11 +30,11 @@ struct WorkspaceView: View {
                     toolbar
                     Rectangle().fill(Palette.line).frame(height: 1)
                 }
-                if let job = store.job { progress(job) }
+                if !store.jobs.isEmpty { taskBar }
                 if let paper = store.selected {
                     ReaderView(paper: paper, compact: $compactReader, originalRequest: store.originalRequest,
                                translations: history.first { $0.id == paper.paperID }?.translations ?? [],
-                               busy: store.job != nil,
+                               busy: store.isBusy(paper.paperID),
                                selectTranslation: { store.select($0) },
                                translate: { store.start(paper: paper) })
                         .id(paper.id)
@@ -49,12 +50,10 @@ struct WorkspaceView: View {
         .tint(Palette.teal)
         .foregroundStyle(Palette.ink)
         .sheet(isPresented: $store.settingsOpen) { SettingsView() }
-        .sheet(item: Binding(
-            get: { store.failure.map(Failure.init) },
-            set: { if $0 == nil { store.failure = nil } }
-        )) { issue in
-            ErrorSheet(message: issue.message)
+        .sheet(item: $store.failure) { issue in
+            ErrorSheet(issue: issue)
         }
+        .onChange(of: store.jobs.isEmpty) { empty in if empty { jobsOpen = false } }
     }
 
     private var toolbar: some View {
@@ -70,18 +69,17 @@ struct WorkspaceView: View {
             .padding(11)
             .background(.white.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(linkFocused ? Palette.teal.opacity(0.6) : Palette.line))
-            let disabled = store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.job != nil
             Button { store.start(downloadOnly: true) } label: {
                 Label("仅下载", systemImage: "arrow.down")
             }
             .controlSize(.large)
-            .disabled(disabled)
-            .help("保存原版 PDF  ⇧⌘↩")
+            .disabled(!store.canSubmit)
+            .help("保存原版 PDF 和 TeX 源码  ⇧⌘↩")
             Button { store.start() } label: {
                 Label("下载并翻译", systemImage: "sparkle")
             }
             .buttonStyle(PrimaryButton())
-            .disabled(disabled)
+            .disabled(!store.canSubmit)
             .help("获取 TeX 源码并生成中文版  ⌘↩")
         }
         .padding(.horizontal, 22)
@@ -89,24 +87,95 @@ struct WorkspaceView: View {
         .padding(.bottom, 12)
     }
 
-    private func progress(_ job: JobProgress) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: "waveform.path").foregroundStyle(Palette.teal)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(store.cancelling ? "正在取消…" : job.title).font(.system(size: 12, weight: .semibold))
-                Text(job.detail).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
+    private var taskBar: some View {
+        HStack(spacing: 9) {
+            Button { jobsOpen.toggle() } label: {
+                Label("后台任务 · \(store.jobs.count)", systemImage: "list.bullet.rectangle")
             }
-            Spacer(minLength: 4)
-            ProgressView(value: job.fraction).frame(width: 115)
-            Text("\(Int(job.fraction * 100))%")
-                .font(.system(size: 11, design: .monospaced)).foregroundStyle(Palette.muted)
-            Button("取消") { store.cancel() }.disabled(store.cancelling)
+            .popover(isPresented: $jobsOpen, arrowEdge: .bottom) { taskList }
+            if let job = store.jobs.first(where: \.isRunning) {
+                ProgressView(value: job.progress.fraction).frame(width: 90)
+                Text("\(job.progress.title) · \(job.title)").lineLimit(1)
+                    .foregroundStyle(Palette.muted)
+            }
+            let failures = store.jobs.filter { $0.failure != nil }.count
+            if failures > 0 {
+                Label("\(failures) 项未完成", systemImage: "exclamationmark.circle")
+                    .foregroundStyle(Palette.muted)
+            }
+            Spacer()
+            if compactReader && store.selected != nil {
+                Button {
+                    compactReader = false
+                    linkFocused = true
+                } label: {
+                    Label("添加论文", systemImage: "plus")
+                }
+            }
         }
+        .font(.system(size: 11))
         .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(Palette.mint.opacity(0.2), in: RoundedRectangle(cornerRadius: 9))
-        .padding(.horizontal, 22)
-        .padding(.top, 12)
+        .padding(.vertical, 5)
+        .background(Palette.mint.opacity(0.2))
+    }
+
+    private var taskList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("后台任务").font(.headline)
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(store.jobs) { job in
+                        taskRow(job)
+                        if job.id != store.jobs.last?.id { Divider() }
+                    }
+                }
+            }
+            .frame(height: min(320, CGFloat(max(1, store.jobs.count) * 84)))
+        }
+        .padding(14)
+        .frame(width: 420)
+    }
+
+    private func taskRow(_ job: LibraryJob) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(job.title).font(.system(size: 12, weight: .semibold)).lineLimit(1).help(job.title)
+            HStack(spacing: 8) {
+                Text(job.downloadOnly ? "下载" : "翻译").foregroundStyle(Palette.teal)
+                switch job.phase {
+                case .queued:
+                    Text("排队中")
+                    Spacer()
+                    Button("取消") { store.cancel(job.id) }
+                case .running:
+                    Text(job.progress.title).lineLimit(1)
+                    ProgressView(value: job.progress.fraction).frame(width: 64)
+                    Spacer(minLength: 4)
+                    Button("取消") { store.cancel(job.id) }
+                case .cancelling:
+                    Text("正在取消…")
+                    Spacer()
+                case .failed(let issue):
+                    Text("未完成")
+                    Spacer()
+                    Button("详情") {
+                        jobsOpen = false
+                        store.failure = issue
+                    }
+                    Button("清除") { store.cancel(job.id) }
+                }
+                if let original = job.original {
+                    Button("打开原文") {
+                        store.select(original, original: true)
+                        jobsOpen = false
+                    }
+                }
+            }
+            .font(.system(size: 11))
+            if case .running = job.phase, !job.progress.detail.isEmpty {
+                Text(job.progress.detail).font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(1)
+            }
+        }
+        .padding(.vertical, 8)
     }
 
     private var emptyState: some View {
@@ -165,31 +234,26 @@ struct PrimaryButton: ButtonStyle {
     }
 }
 
-private struct Failure: Identifiable {
-    let message: String
-    var id: String { message }
-}
-
 private struct ErrorSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let message: String
+    let issue: JobFailure
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Label("论文任务未完成", systemImage: "exclamationmark.circle")
                 .font(.title2.weight(.semibold))
             ScrollView {
-                Text(message).font(.system(size: 12)).textSelection(.enabled)
+                Text(issue.message).font(.system(size: 12)).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 300)
             HStack {
                 Button("复制详情") {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(message, forType: .string)
+                    NSPasteboard.general.setString(issue.message, forType: .string)
                 }
-                if message.contains("编译") {
+                if let log = issue.logURL {
                     Button("打开编译日志") {
-                        NSWorkspace.shared.open(Paper.support.appendingPathComponent("LastCompile.log"))
+                        NSWorkspace.shared.open(log)
                     }
                 }
                 Spacer()

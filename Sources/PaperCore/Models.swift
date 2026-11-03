@@ -74,7 +74,12 @@ public struct Paper: Codable, Identifiable, Hashable, Sendable {
     public var originalURL: URL { directory.appendingPathComponent("original.pdf") }
     public var translationURL: URL { directory.appendingPathComponent("chinese.pdf") }
     public var sourceURL: URL { directory.appendingPathComponent("source", isDirectory: true) }
+    public var originalSourceURL: URL { originalSource(in: Self.support) }
     public var directory: URL { directory(in: Self.support) }
+
+    func originalSource(in support: URL) -> URL {
+        directory(in: support).appendingPathComponent("original-source", isDirectory: true)
+    }
 
     func directory(in support: URL) -> URL {
         Self.library(in: support).appendingPathComponent(id.uuidString, isDirectory: true)

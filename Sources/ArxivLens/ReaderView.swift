@@ -219,6 +219,10 @@ struct ReaderView: View {
                 }
             }
             Divider()
+            if let source = ([paper] + translations).lazy.filter({ $0.arxivID == paper.arxivID })
+                .map(\.originalSourceURL).first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+                Button("在访达中显示原版 TeX") { NSWorkspace.shared.open(source) }
+            }
             if paper.hasTranslation {
                 Button("在访达中显示译后 TeX") {
                     NSWorkspace.shared.open(paper.sourceURL)

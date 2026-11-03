@@ -291,7 +291,7 @@ struct LibrarySidebar: View {
         .contextMenu {
             Button(paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文") {
                 store.start(paper: paper)
-            }.disabled(store.job != nil)
+            }.disabled(store.isBusy(entry.id))
             Button("编辑分类…") { editTarget = entry }.disabled(catalog.loadError != nil)
             if catalog.canRefresh(entry.id) {
                 Button("刷新发表信息") { refreshPublications([entry]) }

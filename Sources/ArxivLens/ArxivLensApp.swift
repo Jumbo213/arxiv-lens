@@ -25,12 +25,12 @@ struct ArxivLensApp: App {
                     .keyboardShortcut(",", modifiers: .command)
             }
             CommandGroup(after: .newItem) {
-                Button("仅下载 arXiv 原文") { store.start(downloadOnly: true) }
+                Button("下载 arXiv 原文与源码") { store.start(downloadOnly: true) }
                     .keyboardShortcut(.return, modifiers: [.command, .shift])
-                    .disabled(store.job != nil || store.input.isEmpty)
+                    .disabled(!store.canSubmit)
                 Button("下载并翻译 arXiv 论文") { store.start() }
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(store.job != nil || store.input.isEmpty)
+                    .disabled(!store.canSubmit)
             }
         }
     }
@@ -99,32 +99,85 @@ enum Keychain {
     }
 }
 
+struct JobFailure: Identifiable {
+    let id = UUID()
+    let message: String
+    var logURL: URL?
+}
+
+struct LibraryJob: Identifiable {
+    enum Phase {
+        case queued, running, cancelling, failed(JobFailure)
+    }
+
+    let id: UUID
+    let arxiv: ArxivID
+    let downloadOnly: Bool
+    var title: String
+    var progress = JobProgress(title: "等待开始", detail: "", fraction: 0)
+    var phase = Phase.queued
+    var original: Paper?
+
+    var isRunning: Bool {
+        if case .running = phase { return true }
+        return false
+    }
+
+    var failure: JobFailure? {
+        if case .failed(let failure) = phase { return failure }
+        return nil
+    }
+}
+
 @MainActor
 final class LibraryStore: ObservableObject {
+    private struct Request {
+        let id: UUID
+        let arxiv: ArxivID
+        let paper: Paper?
+        let settings: TranslationSettings?
+    }
+
+    private struct Running {
+        let task: Task<Void, Never>
+        let translating: Bool
+    }
+
     let catalog = CatalogStore()
     @Published var input = ""
     @Published private(set) var selected: Paper?
     @Published private(set) var originalRequest: UUID?
     @Published var papers = Paper.history()
     @Published var settingsOpen = false
-    @Published var job: JobProgress?
-    @Published var failure: String?
-    @Published var cancelling = false
-    private var task: Task<Void, Never>?
-    private var jobHasOriginal = false
+    @Published private(set) var jobs: [LibraryJob] = []
+    @Published var failure: JobFailure?
+    private var pending: [Request] = []
+    private var running: [UUID: Running] = [:]
+    private var readerFollowingJob: UUID?
 
     init() { selected = papers.first }
 
     func select(_ paper: Paper, original: Bool = false) {
+        readerFollowingJob = nil
         originalRequest = original ? UUID() : nil
         selected = paper
     }
 
+    var canSubmit: Bool {
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return (try? ArxivID(input)).map { !isBusy($0.paperID) } ?? true
+    }
+
+    func isBusy(_ paperID: String) -> Bool {
+        jobs.contains { $0.arxiv.paperID == paperID && $0.failure == nil }
+    }
+
     func start(downloadOnly: Bool = false, paper: Paper? = nil) {
-        guard task == nil else { return }
         let link = paper?.arxivID ?? input
-        do { _ = try ArxivID(link) }
-        catch { failure = error.localizedDescription; return }
+        let arxiv: ArxivID
+        do { arxiv = try ArxivID(link) }
+        catch { failure = JobFailure(message: error.localizedDescription); return }
+        guard !isBusy(arxiv.paperID) else { return }
 
         let settings: TranslationSettings?
         if downloadOnly {
@@ -134,45 +187,82 @@ final class LibraryStore: ObservableObject {
             settings = configured
         }
 
-        job = JobProgress(title: downloadOnly ? "准备下载" : "准备翻译", detail: "正在启动任务", fraction: 0)
-        task = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                self.task = nil
-                self.job = nil
-                self.cancelling = false
-                self.jobHasOriginal = false
+        let id = UUID()
+        jobs.removeAll { $0.arxiv.paperID == arxiv.paperID && $0.failure != nil }
+        jobs.append(LibraryJob(id: id, arxiv: arxiv, downloadOnly: downloadOnly, title: paper?.title ?? arxiv.value))
+        pending.append(Request(id: id, arxiv: arxiv, paper: paper, settings: settings))
+        if let paper, selected?.id == paper.id { readerFollowingJob = id }
+        if paper == nil { input = "" }
+        startPending()
+    }
+
+    private func startPending() {
+        while running.count < 3 {
+            // Leave a slot available for downloading while two long translations run.
+            let canTranslate = running.values.filter(\.translating).count < 2
+            guard let index = pending.firstIndex(where: { $0.settings == nil || canTranslate }) else { return }
+            let request = pending.remove(at: index)
+            editJob(request.id) { $0.phase = .running }
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await perform(request)
             }
-            do {
-                let report: @Sendable (JobProgress) async -> Void = { [weak self] status in
-                    await self?.update(status)
-                }
-                let result: Paper
-                if let settings {
-                    result = try await PaperPipeline.run(input: link, settings: settings, originalReady: { [weak self] original in
-                        await self?.showSavedOriginal(original)
-                    }, report: report)
-                } else {
-                    result = try await PaperPipeline.download(input: link, report: report)
-                }
-                papers = Paper.history()
-                select(result, original: downloadOnly)
-                if paper == nil, input == link { input = "" }
-                autoClassify(result, settings: settings)
-            } catch {
-                if !Task.isCancelled {
-                    let saved = jobHasOriginal ? "原版 PDF 已保存在左侧文献库，可打开原文或再次翻译。\n\n" : ""
-                    failure = saved + error.localizedDescription
+            running[request.id] = Running(task: task, translating: request.settings != nil)
+        }
+    }
+
+    private func perform(_ request: Request) async {
+        let id = request.id
+        defer {
+            running[id] = nil
+            if readerFollowingJob == id { readerFollowingJob = nil }
+            startPending()
+        }
+        let report: @Sendable (JobProgress) async -> Void = { [weak self] status in
+            await self?.update(status, id: id)
+        }
+        let originalReady: @Sendable (Paper) async -> Void = { [weak self] paper in
+            await self?.showSavedOriginal(paper, id: id)
+        }
+        do {
+            let result: Paper
+            if let settings = request.settings {
+                result = try await PaperPipeline.run(input: request.arxiv.value, settings: settings,
+                                                     savedPaper: request.paper, originalReady: originalReady, report: report)
+            } else {
+                result = try await PaperPipeline.download(input: request.arxiv.value, originalReady: originalReady,
+                                                          report: report)
+            }
+            papers = Paper.history()
+            if selected == nil || readerFollowingJob == id {
+                select(result, original: request.settings == nil)
+            }
+            jobs.removeAll { $0.id == id }
+            if !Task.isCancelled { autoClassify(result, settings: request.settings) }
+        } catch {
+            if Task.isCancelled {
+                jobs.removeAll { $0.id == id }
+            } else {
+                editJob(id) { job in
+                    let saved = job.original == nil ? "" : "原版 PDF 已保存在左侧文献库。\n\n"
+                    let log = (error as? PaperPipeline.CompileFailure)?.logURL
+                    job.phase = .failed(JobFailure(message: "\(job.title)\n\n" + saved + error.localizedDescription,
+                                                   logURL: log))
                 }
             }
         }
     }
 
-    private func showSavedOriginal(_ paper: Paper) {
-        jobHasOriginal = true
-        guard !papers.contains(where: { $0.id == paper.id }) else { return }
-        papers = Paper.history()
-        select(paper, original: true)
+    private func showSavedOriginal(_ paper: Paper, id: UUID) {
+        editJob(id) { job in
+            job.original = paper
+            job.title = paper.title
+        }
+        if !papers.contains(where: { $0.id == paper.id }) { papers = Paper.history() }
+        if selected == nil {
+            select(paper, original: true)
+            readerFollowingJob = id
+        }
     }
 
     func apiSettings(interactive: Bool = true) -> TranslationSettings? {
@@ -202,10 +292,23 @@ final class LibraryStore: ObservableObject {
         catalog.classify([record], settings: settings)
     }
 
-    private func update(_ progress: JobProgress) { job = progress }
+    private func editJob(_ id: UUID, _ edit: (inout LibraryJob) -> Void) {
+        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+        edit(&jobs[index])
+    }
 
-    func cancel() {
-        cancelling = true
-        task?.cancel()
+    private func update(_ progress: JobProgress, id: UUID) {
+        editJob(id) { $0.progress = progress }
+    }
+
+    func cancel(_ id: UUID) {
+        if readerFollowingJob == id { readerFollowingJob = nil }
+        if let active = running[id] {
+            editJob(id) { $0.phase = .cancelling }
+            active.task.cancel()
+        } else {
+            pending.removeAll { $0.id == id }
+            jobs.removeAll { $0.id == id }
+        }
     }
 }
