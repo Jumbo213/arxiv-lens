@@ -15,7 +15,7 @@ class Handler(BaseHTTPRequestHandler):
             content = "OK"
         else:
             inputs = json.loads(user)["excerpts"]
-            content = json.dumps(["译文 " + text for text in inputs], ensure_ascii=False)
+            content = json.dumps({index: "译文 " + text for index, text in inputs.items()}, ensure_ascii=False)
         response = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

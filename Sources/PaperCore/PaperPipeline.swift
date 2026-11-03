@@ -57,7 +57,7 @@ public enum PaperPipeline {
                 try Task.checkCancellation()
                 var end = start
                 var budget = 0
-                while end < draft.units.count && end - start < 18 {
+                while end < draft.units.count && end - start < 12 {
                     let size = draft.units[end].prompt.utf16.count
                     if end > start && budget + size > 5300 { break }
                     budget += size
@@ -74,9 +74,12 @@ public enum PaperPipeline {
                         // Retry only the affected excerpts. Keep a failed unit in
                         // its original language rather than applying broken TeX.
                         let failed = replies.indices.filter { replies[$0] == nil }
-                        let recovered = try await api.translate(failed.map { missing[$0] }[...],
-                                                                title: title, context: context, retry: true)
-                        for (index, value) in zip(failed, recovered) { replies[index] = value }
+                        for start in stride(from: 0, to: failed.count, by: 3) {
+                            let chunk = failed[start..<min(start + 3, failed.count)]
+                            let recovered = try await api.translate(chunk.map { missing[$0] }[...],
+                                                                    title: title, context: context, retry: true)
+                            for (index, value) in zip(chunk, recovered) { replies[index] = value }
+                        }
                     }
                     var next = 0
                     for i in batch.indices where batch[i] == nil {

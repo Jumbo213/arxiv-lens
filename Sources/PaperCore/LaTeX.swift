@@ -34,8 +34,11 @@ struct TranslationUnit: Sendable {
     func restore(_ translated: String) -> String? {
         let translated = translated.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !translated.isEmpty, translated.utf16.count < max(350, prompt.utf16.count * 4),
-              !translated.hasPrefix("\u{60}"),
-              translated.range(of: #"\p{Script=Han}"#, options: .regularExpression) != nil else { return nil }
+              !translated.hasPrefix("\u{60}") else { return nil }
+        let hasChinese = translated.range(of: #"\p{Script=Han}"#, options: .regularExpression) != nil
+        let unchangedName = tokens.isEmpty && translated == prompt && prompt.utf16.count <= 40
+            && prompt.split(whereSeparator: \.isWhitespace).count <= 4
+        guard hasChinese || unchangedName else { return nil }
         let input = translated as NSString
         let markers = Self.marker.matches(translated)
         guard markers.map({ input.substring(with: $0.range) }) == tokens.indices.map(Self.marker) else { return nil }
@@ -416,6 +419,7 @@ private struct Scanner {
         var prompt = ""
         for (range, protected) in relevant {
             let value = text.substring(with: range)
+            if !protected && value.range(of: #"ZXQ[0-9]{4}QXZ"#, options: .regularExpression) != nil { return }
             if protected {
                 prompt += TranslationUnit.marker(tokens.count)
                 tokens.append(value)
