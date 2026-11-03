@@ -10,6 +10,8 @@ struct PaperCoreTests {
             try tests.testProtectedTokensRejectReorderAndEscapeProse()
             tests.testGlossary()
             tests.testHistoryGroups()
+            tests.testCatalogMetadata()
+            try await tests.testCatalogAPI()
             try tests.testRewriteMultifilePaper()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
             print("All smoke tests passed.")
@@ -55,6 +57,47 @@ struct PaperCoreTests {
         expectEqual(groups[0].id, "1706.03762")
         expectEqual(groups[0].translations, [second, first])
         expectEqual(groups[1].translations, [distinct])
+    }
+
+    func testCatalogMetadata() {
+        let parsed = ArxivDownload.bibliographicDetails(#"""
+        <meta name="citation_title" content="A &amp; B" /><meta name="citation_author" content="Lin, A" />
+        <meta name="citation_abstract" content="Research on semantic retrieval." />
+        <meta name="citation_date" content="2025/03/09" />
+        <td class="tablecell jref">Journal of Testing <a href="#">12(3)</a></td>
+        <td class="tablecell comments">Final version</td>
+        """#)
+        expectEqual(parsed.title, "A & B")
+        expectEqual(parsed.metadata?.authors, ["Lin, A"])
+        expectEqual(parsed.metadata?.abstract, "Research on semantic retrieval.")
+        expectEqual(parsed.metadata?.publication, "Journal of Testing 12(3)")
+        expectEqual(parsed.metadata?.comments, "Final version")
+        expectEqual(LibraryCatalog.initial("《Transformer》"), "T")
+        expectEqual(LibraryCatalog.initial("神经符号"), "S")
+        expectEqual(LibraryCatalog.initial("Évaluation"), "E")
+        expectEqual(LibraryCatalog.initial("2025 Report"), "#")
+        expectEqual(try? ArxivID("hep-th/9901001").submissionMonth, "1999-01")
+    }
+
+    func testCatalogAPI() async throws {
+        guard let endpoint = ProcessInfo.processInfo.environment["ARXIV_LENS_TEST_ENDPOINT"] else { return }
+        let settings = try TranslationSettings(url: endpoint, model: "mock", key: "")
+        let a = Paper(id: UUID(), arxivID: "1706.03762v7", title: "Attention Is All You Need",
+                      completedAt: .now, untranslated: 0,
+                      metadata: PaperMetadata(abstract: "A study of Transformer attention.",
+                                              authors: [], arxivDate: "2017-06", publication: "NeurIPS 2017", comments: nil))
+        let b = Paper(id: UUID(), arxivID: "1706.03763v1", title: "Unrelated Paper",
+                      completedAt: .now, untranslated: 0)
+        let entries = Paper.groupedHistory([a, b])
+        let classified = try await LibraryAI.classify(entries, categories: ["自然语言处理"], settings: settings)
+        expectEqual(Set(classified.keys), Set(entries.map(\.id)))
+        expectEqual(classified[a.paperID]?.kind, .conference)
+        expectEqual(classified[b.paperID]?.kind, .preprint)
+        expectEqual(classified[a.paperID]?.keywords, ["注意力", "Transformer"])
+        let hits = try await LibraryAI.search("找出提出 Transformer 的论文", in: entries,
+                                             classifications: classified, settings: settings) { _, _ in }
+        expectEqual(hits.map(\.id), [a.paperID])
+        print("VERIFIED classification, keyword normalization, and local-ID-constrained semantic search")
     }
 
     func testGlossary() {
@@ -171,6 +214,14 @@ struct PaperCoreTests {
             expectTrue(!String(decoding: legacyJSON, as: UTF8.self).contains("downloadOnly"))
             expectTrue(Paper.history(in: support).contains(persisted))
             print("VERIFIED \(paper.arxivID) \(paper.title) · pages \(original.pageCount) → \(chinese.pageCount)")
+            let retranslated = try await PaperPipeline.run(input: paper.arxivID, settings: settings, support: support) { _ in }
+            expectTrue(retranslated.id != paper.id && retranslated.hasTranslation)
+            expectEqual(retranslated.arxivID, paper.arxivID)
+            let group = Paper.groupedHistory(Paper.history(in: support)).first { $0.id == paper.paperID }
+            expectEqual(group?.latest.id, retranslated.id)
+            expectTrue(group?.translations.contains(paper) == true)
+            print("VERIFIED same-version retranslation preserves the previous edition")
+
             if let output = environment["ARXIV_LENS_TEST_COPY_TO"] {
                 let destination = URL(fileURLWithPath: output, isDirectory: true)
                 try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)

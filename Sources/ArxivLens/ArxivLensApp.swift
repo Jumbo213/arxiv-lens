@@ -1,4 +1,5 @@
 import AppKit
+import LocalAuthentication
 import PaperCore
 import Security
 import SwiftUI
@@ -42,10 +43,15 @@ enum Keychain {
         kSecAttrAccount as String: "translation-api"
     ]
 
-    static func read() -> String {
+    static func read(interactive: Bool = true) -> String {
         var args = query
         args[kSecReturnData as String] = true
         args[kSecMatchLimit as String] = kSecMatchLimitOne
+        if !interactive {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            args[kSecUseAuthenticationContext as String] = context
+        }
         var result: CFTypeRef?
         guard SecItemCopyMatching(args as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return "" }
@@ -71,6 +77,7 @@ enum Keychain {
 
 @MainActor
 final class LibraryStore: ObservableObject {
+    let catalog = CatalogStore()
     @Published var input = ""
     @Published private(set) var selected: Paper?
     @Published private(set) var originalRequest: UUID?
@@ -98,16 +105,8 @@ final class LibraryStore: ObservableObject {
         if downloadOnly {
             settings = nil
         } else {
-            let defaults = UserDefaults.standard
-            do {
-                settings = try TranslationSettings(url: defaults.string(forKey: "endpoint") ?? "",
-                    model: defaults.string(forKey: "model") ?? "", key: Keychain.read(),
-                    glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "",
-                    lineSpacing: LineSpacing(rawValue: defaults.string(forKey: "lineSpacing") ?? "") ?? .comfortable)
-            } catch {
-                settingsOpen = true
-                return
-            }
+            guard let configured = apiSettings() else { return }
+            settings = configured
         }
 
         job = JobProgress(title: downloadOnly ? "准备下载" : "准备翻译", detail: "正在启动任务", fraction: 0)
@@ -127,10 +126,38 @@ final class LibraryStore: ObservableObject {
                 papers = Paper.history()
                 select(result, original: downloadOnly)
                 if paper == nil, input == link { input = "" }
+                autoClassify(result, settings: settings)
             } catch {
                 if !Task.isCancelled { failure = error.localizedDescription }
             }
         }
+    }
+
+    func apiSettings(interactive: Bool = true) -> TranslationSettings? {
+        let defaults = UserDefaults.standard
+        let endpoint = defaults.string(forKey: "endpoint") ?? ""
+        let model = defaults.string(forKey: "model") ?? ""
+        guard !endpoint.isEmpty, !model.isEmpty else {
+            if interactive { settingsOpen = true }
+            return nil
+        }
+        do {
+            return try TranslationSettings(url: endpoint,
+                model: model, key: Keychain.read(interactive: interactive),
+                glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "",
+                lineSpacing: LineSpacing(rawValue: defaults.string(forKey: "lineSpacing") ?? "") ?? .comfortable)
+        } catch {
+            if interactive { settingsOpen = true }
+            return nil
+        }
+    }
+
+    private func autoClassify(_ paper: Paper, settings: TranslationSettings?) {
+        guard UserDefaults.standard.object(forKey: "autoClassify") as? Bool ?? true,
+              catalog.entries[paper.paperID] == nil,
+              let record = Paper.groupedHistory(papers).first(where: { $0.id == paper.paperID }),
+              let settings = settings ?? apiSettings(interactive: false) else { return }
+        catalog.classify([record], settings: settings)
     }
 
     private func update(_ progress: JobProgress) { job = progress }

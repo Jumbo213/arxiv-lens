@@ -25,7 +25,7 @@ public enum PaperPipeline {
         // For a link without a version, resolve the current version first.
         let saved = requested.isVersioned ? history.first { $0.arxivID == requested.value } : nil
         await report(JobProgress("连接 arXiv", "识别论文标题与版本", 0.05))
-        let metadata = if let saved { (id: requested, title: Optional(saved.title)) }
+        let metadata = if let saved { (id: requested, title: Optional(saved.title), details: saved.metadata) }
             else { await ArxivDownload.metadata(requested) }
         let arxiv = metadata.id
         try Task.checkCancellation()
@@ -57,7 +57,7 @@ public enum PaperPipeline {
 
         guard let settings else {
             let paper = Paper(id: id, arxivID: arxiv.value, title: metadata.title ?? fallbackTitle,
-                              completedAt: .now, untranslated: 0, downloadOnly: true)
+                              completedAt: .now, untranslated: 0, downloadOnly: true, metadata: metadata.details)
             try publish(paper, from: result, in: support)
             await report(JobProgress("原文已加入文献库", paper.title, 1))
             return paper
@@ -158,7 +158,8 @@ public enum PaperPipeline {
             throw LensError("XeLaTeX 没有生成可读的 PDF。")
         }
         try fm.copyItem(at: compiled, to: result.appendingPathComponent("chinese.pdf"))
-        let paper = Paper(id: id, arxivID: arxiv.value, title: title, completedAt: .now, untranslated: untranslated)
+        let paper = Paper(id: id, arxivID: arxiv.value, title: title, completedAt: .now,
+                          untranslated: untranslated, metadata: metadata.details ?? cached?.metadata)
         try publish(paper, from: result, in: support)
         await report(JobProgress("已加入文献库", title, 1))
         return paper
@@ -184,24 +185,48 @@ private final class ArxivRedirects: NSObject, URLSessionTaskDelegate, Sendable {
 enum ArxivDownload {
     private static let session = URLSession(configuration: .ephemeral, delegate: ArxivRedirects(), delegateQueue: nil)
 
-    static func metadata(_ requested: ArxivID) async -> (id: ArxivID, title: String?) {
+    static func metadata(_ requested: ArxivID) async -> (id: ArxivID, title: String?, details: PaperMetadata?) {
         let request = URLRequest(url: requested.abstractURL, timeoutInterval: 15)
         guard let (data, response) = try? await session.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
-              let html = String(data: data, encoding: .utf8) else { return (requested, nil) }
-        let pattern = #"(?i)<meta\s+name=["']citation_title["']\s+content="([^"]+)""#
-        let title = html.range(of: pattern, options: .regularExpression).flatMap { range -> String? in
-            let tag = html[range]
-            guard let prefix = tag.range(of: #"content=""#) else { return nil }
-            return decodeEntities(String(tag[prefix.upperBound...].dropLast()))
-        }
-        if requested.isVersioned { return (requested, title) }
-        let regex = try! NSRegularExpression(pattern: #"/abs/"# + NSRegularExpression.escapedPattern(for: requested.value) + #"v([0-9]+)(?=["'?#<\s])"#)
+              let html = String(data: data, encoding: .utf8) else { return (requested, nil, nil) }
         let ns = html as NSString
-        let versions = regex.matches(in: html, range: NSRange(location: 0, length: ns.length))
+        let range = NSRange(location: 0, length: ns.length)
+        let details = bibliographicDetails(html)
+        let title = details.title
+        if requested.isVersioned { return (requested, title, details.metadata) }
+        let regex = try! NSRegularExpression(pattern: #"/abs/"# + NSRegularExpression.escapedPattern(for: requested.value) + #"v([0-9]+)(?=["'?#<\s])"#)
+        let versions = regex.matches(in: html, range: range)
             .compactMap { Int(ns.substring(with: $0.range(at: 1))) }
         let version = versions.max().flatMap { try? ArxivID("\(requested.value)v\($0)") }
-        return (version ?? requested, title)
+        return (version ?? requested, title, details.metadata)
+    }
+
+    static func bibliographicDetails(_ html: String) -> (title: String?, metadata: PaperMetadata?) {
+        let ns = html as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        let citation = try! NSRegularExpression(pattern: #"(?i)<meta\s+name=["']citation_([a-z_]+)["']\s+content="([^"]*)""#)
+        let fields = Dictionary(grouping: citation.matches(in: html, range: range), by: {
+            ns.substring(with: $0.range(at: 1)).lowercased()
+        }).mapValues { $0.map { decodeEntities(ns.substring(with: $0.range(at: 2))) }.filter { !$0.isEmpty } }
+        func tableCell(_ name: String) -> String? {
+            let pattern = #"(?is)<td\b[^>]*class=["'][^"']*\b"# + name + #"\b[^"']*["'][^>]*>(.*?)</td>"#
+            guard let match = try? NSRegularExpression(pattern: pattern).firstMatch(in: html, range: range) else {
+                return nil
+            }
+            let value = decodeEntities(ns.substring(with: match.range(at: 1))
+                .replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression))
+            return value.isEmpty ? nil : value
+        }
+        let abstract = fields["abstract"]?.first
+        let authors = fields["author"] ?? []
+        let date = fields["date"]?.first
+        let publication = tableCell("jref") ?? fields["journal_title"]?.first ?? fields["conference_title"]?.first
+        let comments = tableCell("comments")
+        let metadata = abstract != nil || !authors.isEmpty || date != nil || publication != nil || comments != nil
+            ? PaperMetadata(abstract: abstract, authors: authors, arxivDate: date, publication: publication, comments: comments)
+            : nil
+        return (fields["title"]?.first, metadata)
     }
 
     static func fetch(_ url: URL, to destination: URL) async throws {

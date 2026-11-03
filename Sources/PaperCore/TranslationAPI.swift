@@ -158,6 +158,12 @@ struct TranslationAPI: Sendable {
         ]
         let data = try JSONSerialization.data(withJSONObject: payload)
         let reply = try await ask(system: system, user: String(decoding: data, as: UTF8.self), json: true)
+        guard let translations = try? JSONDecoder().decode([String: String].self, from: Self.jsonData(reply))
+        else { return Array(repeating: nil, count: units.count) }
+        return zip(units, ids).map { unit, id in translations[id].flatMap(unit.restore) }
+    }
+
+    static func jsonData(_ reply: String) -> Data {
         let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         let json: String
         if clean.hasPrefix("\u{60}\u{60}\u{60}"), let newline = clean.firstIndex(of: "\n"),
@@ -166,8 +172,6 @@ struct TranslationAPI: Sendable {
         } else {
             json = clean
         }
-        guard let translations = try? JSONDecoder().decode([String: String].self, from: Data(json.utf8))
-        else { return Array(repeating: nil, count: units.count) }
-        return zip(units, ids).map { unit, id in translations[id].flatMap(unit.restore) }
+        return Data(json.utf8)
     }
 }

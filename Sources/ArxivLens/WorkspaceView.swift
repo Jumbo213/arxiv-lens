@@ -16,25 +16,14 @@ enum Palette {
 struct WorkspaceView: View {
     @ObservedObject var store: LibraryStore
     @AppStorage("compactReader") private var compactReader = true
-    @ViewState private var search = ""
     @FocusState private var linkFocused: Bool
 
     private var history: [Paper.HistoryEntry] { Paper.groupedHistory(store.papers) }
 
-    private var filtered: [Paper.HistoryEntry] {
-        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        if query.isEmpty { return history }
-        return history.filter { entry in
-            entry.translations.contains { paper in
-                paper.title.localizedCaseInsensitiveContains(query) || paper.arxivID.localizedCaseInsensitiveContains(query)
-            }
-        }
-    }
-
     var body: some View {
         HStack(spacing: 0) {
-            sidebar
-                .frame(width: 254)
+            LibrarySidebar(store: store, catalog: store.catalog)
+                .frame(width: 260)
             VStack(spacing: 0) {
                 if store.selected == nil || !compactReader {
                     toolbar
@@ -66,115 +55,6 @@ struct WorkspaceView: View {
         )) { issue in
             ErrorSheet(message: issue.message)
         }
-    }
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 11) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10).fill(Palette.mint).frame(width: 38, height: 38)
-                    Image(systemName: "book.pages").font(.system(size: 19, weight: .medium)).foregroundStyle(Palette.sidebar)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Arxiv Lens").font(.system(size: 21, weight: .semibold, design: .serif))
-                        .foregroundStyle(.white)
-                    Text("论文翻译与阅读").font(.system(size: 11)).foregroundStyle(Palette.soft)
-                }
-            }
-            .padding(.top, 48)
-            .padding(.bottom, 28)
-            .padding(.horizontal, 20)
-
-            HStack(spacing: 7) {
-                Image(systemName: "magnifyingglass").font(.system(size: 11))
-                ZStack(alignment: .leading) {
-                    if search.isEmpty {
-                        Text("搜索标题或编号").foregroundStyle(Palette.soft).allowsHitTesting(false)
-                    }
-                    TextField("", text: $search)
-                        .textFieldStyle(.plain).foregroundStyle(.white)
-                        .accessibilityLabel("搜索标题或编号")
-                }
-                if !search.isEmpty {
-                    Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain).accessibilityLabel("清除搜索")
-                }
-            }
-            .font(.system(size: 12))
-            .foregroundStyle(Palette.soft)
-            .padding(9)
-            .background(.white.opacity(0.075), in: RoundedRectangle(cornerRadius: 7))
-            .padding(.horizontal, 15)
-
-            HStack {
-                Text("文献库").font(.system(size: 11, weight: .semibold))
-                Spacer()
-                Text("\(history.count)").font(.system(size: 10, design: .monospaced))
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(.white.opacity(0.09), in: Capsule())
-            }
-            .foregroundStyle(Palette.soft)
-            .padding(.horizontal, 20)
-            .padding(.top, 24)
-            .padding(.bottom, 9)
-
-            ScrollView {
-                LazyVStack(spacing: 5) {
-                    ForEach(filtered) { entry in
-                        let paper = entry.latest
-                        let translationCount = entry.translations.filter(\.hasTranslation).count
-                        let active = entry.id == store.selected?.paperID
-                        Button { store.select(paper) } label: {
-                            HStack(alignment: .top, spacing: 9) {
-                                Image(systemName: "doc.text").font(.system(size: 12))
-                                    .foregroundStyle(active ? Palette.mint : Palette.soft).padding(.top, 2)
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(paper.title).lineLimit(3)
-                                        .font(.system(size: 12, weight: active ? .semibold : .medium))
-                                        .foregroundStyle(.white)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                    HStack(spacing: 7) {
-                                        Text(paper.arxivID)
-                                            .font(.system(size: 10, design: .monospaced))
-                                        if !paper.hasTranslation {
-                                            Text("仅原文").font(.system(size: 10))
-                                        } else if translationCount > 1 {
-                                            Text("\(translationCount) 个译本").font(.system(size: 10))
-                                        }
-                                    }
-                                    .foregroundStyle(Palette.soft)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                            .padding(10)
-                            .background(active ? Palette.teal.opacity(0.6) : .clear, in: RoundedRectangle(cornerRadius: 8))
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(paper.title)
-                    }
-                    if filtered.isEmpty {
-                        Text(search.isEmpty ? "下载或译完的论文会显示在这里" : "没有匹配的论文")
-                            .font(.system(size: 11)).foregroundStyle(Palette.soft)
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(9)
-                    }
-                }.padding(.horizontal, 12)
-            }
-
-            Button { store.settingsOpen = true } label: {
-                Label("翻译与 TeX 设置", systemImage: "gearshape")
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.soft)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
-            }
-            .buttonStyle(.plain)
-            .padding(14)
-        }
-        .background(
-            LinearGradient(colors: [Palette.sidebar, Color(red: 0.074, green: 0.205, blue: 0.213)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-        )
     }
 
     private var toolbar: some View {

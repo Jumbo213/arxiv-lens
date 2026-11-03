@@ -197,6 +197,9 @@ struct ReaderView: View {
 
     private var fileMenu: some View {
         Menu {
+            Button(paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文", action: translate)
+                .disabled(busy)
+            Divider()
             Button("导出原版 PDF…") { export(.original) }
             if paper.hasTranslation {
                 Button("导出中文 PDF…") { export(.chinese) }

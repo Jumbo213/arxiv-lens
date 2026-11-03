@@ -14,8 +14,20 @@ class Handler(BaseHTTPRequestHandler):
         if user == "Say OK.":
             content = "OK"
         else:
-            inputs = json.loads(user)["excerpts"]
-            content = json.dumps({index: "译文 " + text for index, text in inputs.items()}, ensure_ascii=False)
+            payload = json.loads(user)
+            if payload.get("task") == "classify":
+                rows = [{"id": row["id"], "category": "自然语言处理", "keywords": ["注意力", "注意力", "Transformer"],
+                         "kind": "conference"} for row in payload["documents"]]
+                rows.append({"id": "not-in-library", "category": "主题", "keywords": [], "kind": "journal"})
+                answer = {"classifications": rows}
+            elif payload.get("task") == "search":
+                rows = [{"id": row["id"], "score": 94, "reason": "使用注意力机制"}
+                        for row in payload["documents"] if "Attention" in row["title"]]
+                rows.append({"id": "not-in-library", "score": 99, "reason": "无效编号"})
+                answer = {"matches": rows}
+            else:
+                answer = {index: "译文 " + text for index, text in payload["excerpts"].items()}
+            content = json.dumps(answer, ensure_ascii=False)
         response = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

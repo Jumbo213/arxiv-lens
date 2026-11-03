@@ -38,6 +38,13 @@ public struct ArxivID: Hashable, Sendable {
 
     var isVersioned: Bool { value.range(of: #"v[0-9]+$"#, options: .regularExpression) != nil }
 
+    var submissionMonth: String? {
+        let digits = paperID.split(separator: "/").last?.prefix(4) ?? ""
+        guard digits.count == 4, let year = Int(digits.prefix(2)), let month = Int(digits.suffix(2)),
+              (1...12).contains(month) else { return nil }
+        return String(format: "%04d-%02d", (year >= 91 ? 1900 : 2000) + year, month)
+    }
+
     public var abstractURL: URL { url("abs") }
     func url(_ type: String) -> URL { URL(string: "https://arxiv.org/\(type)/\(value)")! }
 }
@@ -48,16 +55,19 @@ public struct Paper: Codable, Identifiable, Hashable, Sendable {
     public let title: String
     public let completedAt: Date
     public let untranslated: Int
+    public let metadata: PaperMetadata?
     private let downloadOnly: Bool?
     public var hasTranslation: Bool { downloadOnly != true }
 
-    init(id: UUID, arxivID: String, title: String, completedAt: Date, untranslated: Int, downloadOnly: Bool? = nil) {
+    init(id: UUID, arxivID: String, title: String, completedAt: Date, untranslated: Int,
+         downloadOnly: Bool? = nil, metadata: PaperMetadata? = nil) {
         self.id = id
         self.arxivID = arxivID
         self.title = title
         self.completedAt = completedAt
         self.untranslated = untranslated
         self.downloadOnly = downloadOnly
+        self.metadata = metadata
     }
 
     public var paperID: String { (try? ArxivID(arxivID).paperID) ?? arxivID }
