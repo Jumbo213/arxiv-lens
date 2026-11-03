@@ -20,8 +20,8 @@ public struct AvailableModel: Identifiable, Sendable {
 public struct APIConnection: Hashable, Sendable {
     public let endpoint: URL
     public let modelsURL: URL
-    let key: String
-    public var hasKey: Bool { !key.isEmpty }
+    private let keys: [String]
+    fileprivate var primaryKey: String { keys.first ?? "" }
 
     public static func chatEndpoint(for url: String) throws -> URL {
         let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -32,6 +32,12 @@ public struct APIConnection: Hashable, Sendable {
             throw LensError("请填写 HTTPS API 地址。本机服务也可以使用 localhost 或 127.0.0.1 的 HTTP 地址。")
         }
         let path = components.percentEncodedPath
+        components.host = host
+        components.scheme = components.scheme?.lowercased()
+        if (components.scheme == "https" && components.port == 443) ||
+           (components.scheme == "http" && components.port == 80) {
+            components.port = nil
+        }
         let normalized = path.replacingOccurrences(of: #"/+$"#, with: "", options: .regularExpression)
         if normalized.isEmpty {
             components.percentEncodedPath = "/v1/chat/completions"
@@ -45,36 +51,42 @@ public struct APIConnection: Hashable, Sendable {
     }
 
     public init(url: String, key: String) throws {
+        try self.init(url: url, keys: [key])
+    }
+
+    public init(url: String, keys: [String]) throws {
         let endpoint = try Self.chatEndpoint(for: url)
         guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             throw LensError("API 地址格式有误。")
         }
         let host = components.host?.lowercased() ?? ""
-        let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty || ["localhost", "127.0.0.1", "[::1]", "::1"].contains(host) else {
+        var seen = Set<String>()
+        let keys = keys.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+        guard !keys.isEmpty || ["localhost", "127.0.0.1", "[::1]", "::1"].contains(host) else {
             throw LensError("请填写 API Key。")
         }
         components.percentEncodedPath = String(components.percentEncodedPath.dropLast("/chat/completions".count)) + "/models"
         guard let modelsURL = components.url else { throw LensError("模型列表地址格式有误。") }
         self.endpoint = endpoint
         self.modelsURL = modelsURL
-        self.key = key
+        self.keys = keys
     }
 
     public func listModels() async throws -> [AvailableModel] {
         var request = URLRequest(url: modelsURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if hasKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-        let (data, response) = try await TranslationAPI.session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw LensError("无法读取模型列表的响应。") }
-        switch http.statusCode {
+        let reply = try await send(request)
+        switch reply.status {
         case 200..<300: break
         case 401, 403:
-            throw LensError("获取模型列表时鉴权失败（HTTP \(http.statusCode)）。请检查 API Key。")
+            throw LensError("获取模型列表时鉴权失败（HTTP \(reply.status)）。请检查 API Key。")
+        case 402, 429:
+            throw LensError("获取模型列表时额度不足或受到限流（HTTP \(reply.status)）。")
         default:
-            throw LensError("模型列表暂时不可用（HTTP \(http.statusCode)）。可以手动填写模型 ID。")
+            throw LensError("模型列表暂时不可用（HTTP \(reply.status)）。可以手动填写模型 ID。")
         }
-        guard let list = try? JSONDecoder().decode(ModelList.self, from: data) else {
+        guard let list = try? JSONDecoder().decode(ModelList.self, from: reply.data) else {
             throw LensError("接口返回的模型列表格式无法识别。可以手动填写模型 ID。")
         }
         var seen = Set<String>()
@@ -83,6 +95,38 @@ public struct APIConnection: Hashable, Sendable {
                   seen.insert(id).inserted else { return nil }
             return AvailableModel(id: id, name: row.name)
         }.sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    }
+
+    fileprivate func send(_ request: URLRequest, startingAt preferred: Int = 0, retryTemporary: Bool = false)
+        async throws -> (data: Data, status: Int, keyIndex: Int) {
+        let candidates = keys.isEmpty ? [""] : keys
+        for offset in candidates.indices {
+            let index = (preferred + offset) % candidates.count
+            let key = candidates[index]
+            var request = request
+            if !key.isEmpty { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+            for attempt in 0...2 {
+                try Task.checkCancellation()
+                let (data, response) = try await TranslationAPI.session.data(for: request)
+                guard let http = response as? HTTPURLResponse else { throw LensError("无法读取 API 响应。") }
+                let status = http.statusCode
+                if (status == 402 || status == 429) && offset < candidates.count - 1 { break }
+                let limitMayReset = status == 429 && !Self.isQuotaError(data)
+                if retryTemporary && attempt < 2 && (limitMayReset || [500, 502, 503, 504].contains(status)) {
+                    let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? (2 << attempt)
+                    try await Task.sleep(nanoseconds: UInt64(max(1, min(30, retryAfter))) * 1_000_000_000)
+                    continue
+                }
+                return (data, status, index)
+            }
+        }
+        throw LensError("API 暂时不可用。")
+    }
+
+    private static func isQuotaError(_ data: Data) -> Bool {
+        guard let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let error = body["error"] as? [String: Any] else { return false }
+        return (error["code"] as? String) == "insufficient_quota" || (error["type"] as? String) == "insufficient_quota"
     }
 
     private struct ModelList: Decodable {
@@ -94,22 +138,32 @@ public struct APIConnection: Hashable, Sendable {
     }
 }
 
+private actor APIKeyPreference {
+    private(set) var index = 0
+    func prefer(_ index: Int) { self.index = index }
+}
+
 public struct TranslationSettings: Sendable {
-    public let endpoint: URL
+    fileprivate let connection: APIConnection
+    fileprivate let keyPreference = APIKeyPreference()
+    public var endpoint: URL { connection.endpoint }
     public let model: String
-    public let key: String
+    public var key: String { connection.primaryKey }
     public let glossary: String
     public let texPath: String
     public let lineSpacing: LineSpacing
 
     public init(url: String, model: String, key: String, glossary: String = "", texPath: String = "",
                 lineSpacing: LineSpacing = .comfortable) throws {
-        let connection = try APIConnection(url: url, key: key)
+        try self.init(url: url, model: model, keys: [key], glossary: glossary, texPath: texPath, lineSpacing: lineSpacing)
+    }
+
+    public init(url: String, model: String, keys: [String], glossary: String = "", texPath: String = "",
+                lineSpacing: LineSpacing = .comfortable) throws {
+        self.connection = try APIConnection(url: url, keys: keys)
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else { throw LensError("请填写模型 ID。") }
-        self.endpoint = connection.endpoint
         self.model = model
-        self.key = connection.key
         self.glossary = String(glossary.prefix(6000))
         self.texPath = texPath
         self.lineSpacing = lineSpacing
@@ -149,9 +203,6 @@ struct TranslationAPI: Sendable {
         var request = URLRequest(url: settings.endpoint, timeoutInterval: 180)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !settings.key.isEmpty {
-            request.setValue("Bearer \(settings.key)", forHTTPHeaderField: "Authorization")
-        }
         var payload: [String: Any] = [
             "model": settings.model, "messages": [
                 ["role": "system", "content": system], ["role": "user", "content": user]
@@ -162,32 +213,24 @@ struct TranslationAPI: Sendable {
             if json { payload["response_format"] = ["type": "json_object"] }
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        for attempt in 0...2 {
-            let (data, response) = try await Self.session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { throw LensError("无法读取翻译服务的响应。") }
-            let status = http.statusCode
-            if [429, 500, 502, 503, 504].contains(status), attempt < 2 {
-                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? (2 << attempt)
-                try await Task.sleep(nanoseconds: UInt64(max(1, min(30, retryAfter))) * 1_000_000_000)
-                continue
+        let reply = try await settings.connection.send(request, startingAt: settings.keyPreference.index, retryTemporary: true)
+        guard (200..<300).contains(reply.status) else {
+            let hint: String
+            switch reply.status {
+            case 301...399: hint = "请填写最终 API 地址。"
+            case 401, 403: hint = "请检查 API Key 和模型访问权限。"
+            case 402: hint = "请检查 API 余额或添加有额度的备用 Key。"
+            case 404: hint = "请检查 API URL 和模型 ID。"
+            case 429: hint = "请检查 API 额度或稍后重试。"
+            default: hint = "请检查服务状态和模型配置。"
             }
-            guard (200..<300).contains(status) else {
-                let hint: String
-                switch status {
-                case 301...399: hint = "请填写最终 API 地址。"
-                case 401, 403: hint = "请检查 API Key 和模型访问权限。"
-                case 404: hint = "请检查 API URL 和模型 ID。"
-                case 429: hint = "请检查额度或稍后重试。"
-                default: hint = "请检查服务状态和模型配置。"
-                }
-                throw LensError("翻译服务返回 HTTP \(status)。\(hint)")
-            }
-            guard let content = try? JSONDecoder().decode(Response.self, from: data).choices.first?.message.content else {
-                throw LensError("响应缺少 choices[0].message.content。请使用 OpenAI 兼容的 Chat Completions 接口。")
-            }
-            return content
+            throw LensError("翻译服务返回 HTTP \(reply.status)。\(hint)")
         }
-        throw LensError("翻译服务暂时不可用。")
+        await settings.keyPreference.prefer(reply.keyIndex)
+        guard let content = try? JSONDecoder().decode(Response.self, from: reply.data).choices.first?.message.content else {
+            throw LensError("响应缺少 choices[0].message.content。请使用 OpenAI 兼容的 Chat Completions 接口。")
+        }
+        return content
     }
 
     func translate(_ units: ArraySlice<TranslationUnit>, title: String, context: String,

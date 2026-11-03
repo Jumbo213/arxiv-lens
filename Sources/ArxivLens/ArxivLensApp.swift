@@ -36,6 +36,18 @@ struct ArxivLensApp: App {
     }
 }
 
+struct APIProfile: Codable {
+    var model = ""
+    var keys: [String] = []
+
+    mutating func normalize() {
+        model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        var seen = Set<String>()
+        keys = keys.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+}
+
 enum Keychain {
     private static let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -43,7 +55,11 @@ enum Keychain {
         kSecAttrAccount as String: "translation-api"
     ]
 
-    static func read(interactive: Bool = true) -> String {
+    static func scope(_ endpoint: String) -> String? {
+        (try? APIConnection.chatEndpoint(for: endpoint))?.absoluteString
+    }
+
+    static func profiles(interactive: Bool = true) throws -> [String: APIProfile] {
         var args = query
         args[kSecReturnData as String] = true
         args[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -53,20 +69,28 @@ enum Keychain {
             args[kSecUseAuthenticationContext as String] = context
         }
         var result: CFTypeRef?
-        guard SecItemCopyMatching(args as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return "" }
-        return String(decoding: data, as: UTF8.self)
+        let status = SecItemCopyMatching(args as CFDictionary, &result)
+        if status == errSecItemNotFound { return legacyProfile() }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw LensError("无法读取钥匙串中的 API Key（\(status)）。")
+        }
+        if let profiles = try? JSONDecoder().decode([String: APIProfile].self, from: data) {
+            return profiles
+        }
+        // Old releases stored one raw key, associated with the saved endpoint.
+        return legacyProfile(key: String(decoding: data, as: UTF8.self))
     }
 
-    static func save(_ key: String) throws {
-        if key.isEmpty {
-            let status = SecItemDelete(query as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
-                throw LensError("无法移除钥匙串中的 API Key（\(status)）。")
-            }
-            return
-        }
-        let value = [kSecValueData as String: Data(key.utf8)]
+    private static func legacyProfile(key: String = "") -> [String: APIProfile] {
+        let defaults = UserDefaults.standard
+        guard let endpoint = defaults.string(forKey: "endpoint"), let scope = scope(endpoint) else { return [:] }
+        var profile = APIProfile(model: defaults.string(forKey: "model") ?? "", keys: [key])
+        profile.normalize()
+        return [scope: profile]
+    }
+
+    static func save(_ profiles: [String: APIProfile]) throws {
+        let value = [kSecValueData as String: try JSONEncoder().encode(profiles)]
         var status = SecItemUpdate(query as CFDictionary, value as CFDictionary)
         if status == errSecItemNotFound {
             status = SecItemAdd(query.merging(value, uniquingKeysWith: { _, new in new }) as CFDictionary, nil)
@@ -154,14 +178,14 @@ final class LibraryStore: ObservableObject {
     func apiSettings(interactive: Bool = true) -> TranslationSettings? {
         let defaults = UserDefaults.standard
         let endpoint = defaults.string(forKey: "endpoint") ?? ""
-        let model = defaults.string(forKey: "model") ?? ""
-        guard !endpoint.isEmpty, !model.isEmpty else {
+        guard let scope = Keychain.scope(endpoint) else {
             if interactive { settingsOpen = true }
             return nil
         }
         do {
+            let profile = try Keychain.profiles(interactive: interactive)[scope] ?? APIProfile()
             return try TranslationSettings(url: endpoint,
-                model: model, key: Keychain.read(interactive: interactive),
+                model: profile.model, keys: profile.keys,
                 glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "",
                 lineSpacing: LineSpacing(rawValue: defaults.string(forKey: "lineSpacing") ?? "") ?? .comfortable)
         } catch {

@@ -13,6 +13,7 @@ struct PaperCoreTests {
             tests.testCatalogMetadata()
             try tests.testPublicationRefresh()
             try await tests.testCatalogAPI()
+            try await tests.testAPIKeyRotation()
             try tests.testRewriteMultifilePaper()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
             print("All smoke tests passed.")
@@ -30,6 +31,8 @@ struct PaperCoreTests {
         }
         let presetEndpoint = try APIConnection.chatEndpoint(for: "https://api.openai.com/v1")
         expectEqual(presetEndpoint, try APIConnection.chatEndpoint(for: "https://api.openai.com/v1/chat/completions"))
+        expectEqual(presetEndpoint, try APIConnection.chatEndpoint(for: "HTTPS://API.OPENAI.COM:443/v1/"))
+        expectTrue(presetEndpoint != (try APIConnection.chatEndpoint(for: "https://api.openai.com/v1?tenant=two")))
         expectEqual(try APIConnection.chatEndpoint(for: "https://api.deepseek.com/chat/completions").path,
                     "/chat/completions")
         let root = try APIConnection(url: "https://example.com", key: "test")
@@ -38,6 +41,7 @@ struct PaperCoreTests {
         expectEqual(prefixed.modelsURL.path, "/proxy/v1/models")
         expectEqual(prefixed.modelsURL.query, "region=us")
         expectEqual(try APIConnection(url: "http://127.0.0.1:8080/v1", key: "").modelsURL.path, "/v1/models")
+        expectEqual(try APIConnection(url: "http://[::1]:8080/v1", keys: []).modelsURL.path, "/v1/models")
         expectThrowsError(try APIConnection(url: "https://example.com/v1", key: ""))
         expectEqual(try ArxivID("https://arxiv.org/pdf/hep-th/9901001v2.pdf?x=1").value, "hep-th/9901001v2")
         expectEqual(try ArxivID(" arXiv:1706.03762v7 ").value, "1706.03762v7")
@@ -162,6 +166,37 @@ struct PaperCoreTests {
                                              classifications: classified, settings: settings) { _, _ in }
         expectEqual(hits.map(\.id), [a.paperID])
         print("VERIFIED classification, keyword normalization, and local-ID-constrained semantic search")
+    }
+
+    func testAPIKeyRotation() async throws {
+        guard let endpoint = ProcessInfo.processInfo.environment["ARXIV_LENS_TEST_ENDPOINT"] else { return }
+        let keys = [" fixture-low-balance ", "fixture-rate-limit", "fixture-rate-limit", "fixture-model-key"]
+        let connection = try APIConnection(url: endpoint + "/chat/completions?fixture=1", keys: keys)
+        let models = try await connection.listModels()
+        expectEqual(models.count, 2)
+        let settings = try TranslationSettings(url: endpoint, model: "fixture-rotation", keys: keys)
+        let api = TranslationAPI(settings: settings)
+        let first = try await api.ask(system: "", user: "rotate")
+        expectEqual(first, "OK")
+        let next = try await TranslationAPI(settings: settings).ask(system: "", user: "continue")
+        expectEqual(next, "OK")
+        let exhausted = try TranslationSettings(url: endpoint, model: "fixture-rotation",
+                                               keys: ["fixture-low-balance", "fixture-quota"])
+        do {
+            _ = try await TranslationAPI(settings: exhausted).ask(system: "", user: "rotate")
+            preconditionFailure("Expected all keys to be exhausted")
+        } catch {
+            expectTrue(error.localizedDescription.contains("HTTP 429"))
+        }
+        let unrelated = try TranslationSettings(url: endpoint, model: "fixture-rotation",
+                                               keys: ["fixture-invalid-request", "fixture-model-key"])
+        do {
+            _ = try await TranslationAPI(settings: unrelated).ask(system: "", user: "rotate")
+            preconditionFailure("Expected the invalid request to fail without rotating")
+        } catch {
+            expectTrue(error.localizedDescription.contains("HTTP 400"))
+        }
+        print("VERIFIED model and chat key rotation, preferred backup reuse, and bounded errors")
     }
 
     func testGlossary() {

@@ -10,17 +10,16 @@ struct SettingsView: View {
     @AppStorage("texPath") private var savedTex = ""
     @AppStorage("lineSpacing") private var savedSpacing = LineSpacing.comfortable.rawValue
     @ViewState private var endpoint = ""
-    @ViewState private var model = ""
     @ViewState private var glossary = ""
     @ViewState private var tex = ""
     @ViewState private var spacing: LineSpacing = .comfortable
-    @ViewState private var key = ""
+    @ViewState private var profiles: [String: APIProfile] = [:]
+    @ViewState private var editedScopes = Set<String>()
     @ViewState private var status = ""
     @ViewState private var glossaryOpen = false
     @ViewState private var isError = false
     @ViewState private var checking = false
     @ViewState private var checkTask: Task<Void, Never>?
-    @ViewState private var allowedModelURL: URL?
     @ViewState private var modelRefresh = 0
     @ViewState private var models: [AvailableModel] = []
     @ViewState private var modelStatus: String?
@@ -32,11 +31,17 @@ struct SettingsView: View {
         let refresh: Int
     }
 
-    private var modelConnection: APIConnection? { try? APIConnection(url: endpoint, key: key) }
+    private var scope: String? { Keychain.scope(endpoint) }
+    private var profile: APIProfile { scope.flatMap { profiles[$0] } ?? APIProfile() }
+    private var model: Binding<String> {
+        let address = scope
+        return Binding(get: { address.flatMap { profiles[$0]?.model } ?? "" },
+                       set: { value in editProfile(at: address) { $0.model = value } })
+    }
+    private var modelConnection: APIConnection? { try? APIConnection(url: endpoint, keys: profile.keys) }
 
     private var modelRequest: ModelRequest? {
-        guard let connection = modelConnection,
-              !connection.hasKey || allowedModelURL == connection.modelsURL else { return nil }
+        guard let connection = modelConnection else { return nil }
         return ModelRequest(connection: connection, refresh: modelRefresh)
     }
 
@@ -50,10 +55,10 @@ struct SettingsView: View {
             Divider()
             field("API URL") {
                 HStack(spacing: 8) {
-                    TextField("https://api.example.com/v1", text: $endpoint)
+                    TextField("https://api.example.com/v1", text: Binding(get: { endpoint }, set: changeEndpoint))
                     Menu("服务商预设") {
                         ForEach(APIProviderPreset.presets) { preset in
-                            Button { apply(preset) } label: {
+                            Button { changeEndpoint(preset.url) } label: {
                                 if isCurrent(preset) {
                                     Label(preset.name, systemImage: "checkmark")
                                 } else {
@@ -64,18 +69,10 @@ struct SettingsView: View {
                     }
                     .fixedSize()
                     .disabled(checking)
-                    .help("填入服务商的 API 地址")
+                    .help("切换 API 地址并载入已保存的 Key 和模型")
                 }
             }
-            field("API Key") {
-                SecureField("输入服务商的 API Key", text: Binding(
-                    get: { key },
-                    set: {
-                        key = $0
-                        allowedModelURL = modelConnection?.modelsURL
-                    }
-                ))
-            }
+            field("API Key") { keyControls }
             field("模型 ID") { modelControls }
             HStack {
                 Text("OpenAI 兼容接口，可填写 Base URL 或完整 Chat Completions URL。")
@@ -141,12 +138,11 @@ struct SettingsView: View {
         .foregroundStyle(Palette.ink)
         .onAppear {
             endpoint = savedEndpoint
-            model = savedModel
             glossary = savedGlossary
             tex = savedTex
             spacing = LineSpacing(rawValue: savedSpacing) ?? .comfortable
-            key = Keychain.read()
-            allowedModelURL = modelConnection?.modelsURL
+            do { profiles = try Keychain.profiles() }
+            catch { isError = true; status = error.localizedDescription }
         }
         .task(id: modelRequest) { await fetchModels(modelRequest) }
         .onDisappear { checkTask?.cancel() }
@@ -158,30 +154,95 @@ struct SettingsView: View {
         return current == (try? APIConnection.chatEndpoint(for: preset.url))
     }
 
-    private func apply(_ preset: APIProviderPreset) {
-        if !isCurrent(preset) {
-            key = ""
-            model = ""
-            allowedModelURL = nil
+    private func changeEndpoint(_ url: String) {
+        if scope != Keychain.scope(url) {
             status = ""
+            models = []
+            modelStatus = nil
+            modelPickerOpen = false
         }
-        endpoint = preset.url
+        endpoint = url
+    }
+
+    private func editProfile(at address: String?, _ edit: (inout APIProfile) -> Void) {
+        guard let address else { return }
+        edit(&profiles[address, default: APIProfile()])
+        editedScopes.insert(address)
+    }
+
+    private var keyControls: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            let address = scope
+            let count = profile.keys.count
+            if count > 0 {
+                ScrollViewReader { scroll in
+                    ScrollView {
+                        VStack(spacing: 5) {
+                            ForEach(0..<count, id: \.self) { index in
+                                keyRow(index, address: address)
+                                    .id(index)
+                            }
+                        }
+                    }
+                    .onChange(of: count) { newCount in
+                        if newCount > 3 { scroll.scrollTo(newCount - 1, anchor: .bottom) }
+                    }
+                }
+                .frame(height: CGFloat(min(count, 3) * 32 - 5))
+                .id(address)
+            }
+            HStack(spacing: 8) {
+                Button("新增 Key") { editProfile(at: address) { $0.keys.append("") } }
+                    .disabled(address == nil)
+                Text(address == nil ? "先填写 API 地址。" : "按列表顺序使用。余额不足或限流时自动尝试备用 Key。")
+                    .font(.system(size: 11)).foregroundStyle(Palette.muted)
+            }
+        }
+    }
+
+    private func keyRow(_ index: Int, address: String?) -> some View {
+        HStack(spacing: 6) {
+            SecureField(index == 0 ? "主 Key" : "备用 Key \(index)", text: Binding(
+                get: {
+                    guard let address, let keys = profiles[address]?.keys, keys.indices.contains(index) else { return "" }
+                    return keys[index]
+                },
+                set: { value in
+                    editProfile(at: address) { if $0.keys.indices.contains(index) { $0.keys[index] = value } }
+                }
+            ))
+            .accessibilityLabel(index == 0 ? "主 API Key" : "备用 API Key \(index)")
+            if index > 0 {
+                Button {
+                    editProfile(at: address) { profile in
+                        guard profile.keys.indices.contains(index) else { return }
+                        let key = profile.keys.remove(at: index)
+                        profile.keys.insert(key, at: 0)
+                    }
+                } label: { Image(systemName: "arrow.up.to.line") }
+                    .help("设为主 Key").accessibilityLabel("将备用 Key \(index) 设为主 Key")
+            }
+            Button {
+                editProfile(at: address) { if $0.keys.indices.contains(index) { $0.keys.remove(at: index) } }
+            } label: { Image(systemName: "minus.circle") }
+                .help("移除此 Key").accessibilityLabel("移除第 \(index + 1) 把 Key")
+        }
     }
 
     private var modelControls: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 8) {
-                TextField("选择模型或直接填写模型 ID", text: $model)
+                TextField("选择模型或直接填写模型 ID", text: model)
+                    .disabled(scope == nil)
                 Button("选择模型") { modelPickerOpen = true }
                     .disabled(models.isEmpty || loadingModels)
                     .popover(isPresented: $modelPickerOpen, arrowEdge: .bottom) {
-                        ModelPicker(models: models, selectedID: model) { selected in
-                            model = selected
+                        ModelPicker(models: models, selectedID: model.wrappedValue) { selected in
+                            model.wrappedValue = selected
                             modelPickerOpen = false
                         }
                     }
                 Button {
-                    allowedModelURL = modelConnection?.modelsURL
                     modelRefresh += 1
                 } label: {
                     Image(systemName: "arrow.clockwise")
@@ -200,9 +261,6 @@ struct SettingsView: View {
     private var modelHint: String {
         if loadingModels { return "正在获取模型列表…" }
         if let modelStatus { return modelStatus }
-        if modelConnection != nil && modelRequest == nil {
-            return "API 地址已更换。填写该服务的 Key，或点击刷新使用当前 Key。"
-        }
         return "填写 API 地址和 Key 后自动获取模型，也可以手动输入。"
     }
 
@@ -236,15 +294,23 @@ struct SettingsView: View {
     }
 
     private func settings() throws -> TranslationSettings {
-        try TranslationSettings(url: endpoint, model: model, key: key, glossary: glossary, texPath: tex, lineSpacing: spacing)
+        try TranslationSettings(url: endpoint, model: profile.model, keys: profile.keys,
+                                glossary: glossary, texPath: tex, lineSpacing: spacing)
     }
 
     private func save() {
         do {
-            if !endpoint.isEmpty || !model.isEmpty || !key.isEmpty { _ = try settings() }
-            try Keychain.save(key.trimmingCharacters(in: .whitespacesAndNewlines))
-            savedEndpoint = endpoint
-            savedModel = model
+            let address = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !address.isEmpty { _ = try APIConnection.chatEndpoint(for: address) }
+            var savedProfiles = try Keychain.profiles()
+            for scope in editedScopes {
+                var updated = profiles[scope] ?? APIProfile()
+                updated.normalize()
+                savedProfiles[scope] = updated
+            }
+            try Keychain.save(savedProfiles)
+            savedEndpoint = address
+            savedModel = profile.model.trimmingCharacters(in: .whitespacesAndNewlines)
             savedGlossary = glossary
             savedTex = tex
             savedSpacing = spacing.rawValue

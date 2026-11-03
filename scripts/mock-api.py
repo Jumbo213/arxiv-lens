@@ -9,6 +9,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/models?fixture=1":
             self.send_error(404)
             return
+        if self.fixture_key_error():
+            return
         if self.headers.get("Authorization") != "Bearer fixture-model-key":
             self.send_error(401)
             return
@@ -24,6 +26,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(401)
             return
         user = request["messages"][-1]["content"]
+        if request["model"] == "fixture-rotation":
+            if user == "continue" and self.headers.get("Authorization") != "Bearer fixture-model-key":
+                self.send_error(409)
+                return
+            if self.fixture_key_error():
+                return
+            user = "Say OK."
         if user == "Say OK.":
             content = "OK"
         else:
@@ -44,9 +53,23 @@ class Handler(BaseHTTPRequestHandler):
             content = json.dumps(answer, ensure_ascii=False)
         self.send_json({"choices": [{"message": {"content": content}}]})
 
-    def send_json(self, value):
+    def fixture_key_error(self):
+        key = self.headers.get("Authorization")
+        if key == "Bearer fixture-low-balance":
+            self.send_error(402)
+        elif key == "Bearer fixture-rate-limit":
+            self.send_error(429)
+        elif key == "Bearer fixture-quota":
+            self.send_json({"error": {"code": "insufficient_quota"}}, status=429)
+        elif key == "Bearer fixture-invalid-request":
+            self.send_error(400)
+        else:
+            return False
+        return True
+
+    def send_json(self, value, status=200):
         response = json.dumps(value).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
         self.end_headers()
