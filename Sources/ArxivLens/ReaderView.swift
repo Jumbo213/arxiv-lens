@@ -16,17 +16,26 @@ private enum ReadingMode: String, CaseIterable {
 }
 
 private final class ReaderState: ObservableObject {
+    struct Match: Equatable {
+        let side: Side
+        let spans: [PDFTextSpan]
+    }
+
     let original: PDFDocument?
     let chinese: PDFDocument?
+    let alignment: PDFTextAlignment?
     @Published var mode: ReadingMode = .compare
     @Published var sync = true
     @Published var originalPage = 0
     @Published var chinesePage = 0
+    @Published private(set) var match: Match?
+    private var selectionSide: Side?
     private var anchors: [(Int, Int)] = []
 
     init(_ paper: Paper, showOriginal: Bool) {
         original = PDFDocument(url: paper.originalURL)
         chinese = paper.hasTranslation ? PDFDocument(url: paper.translationURL) : nil
+        alignment = paper.hasTranslation ? PDFTextAlignment.load(for: paper) : nil
         mode = showOriginal || !paper.hasTranslation ? .original : .compare
         if let original, let chinese, let left = original.outlineRoot, let right = chinese.outlineRoot {
             let leftPages = Self.outlinePages(left, document: original)
@@ -58,6 +67,29 @@ private final class ReaderState: ObservableObject {
 
     func document(_ side: Side) -> PDFDocument? { side == .original ? original : chinese }
     func page(_ side: Side) -> Int { side == .original ? originalPage : chinesePage }
+
+    func selected(_ selection: PDFSelection?, on side: Side) {
+        guard mode == .compare, let alignment, let document = document(side) else { return }
+        guard let selection, !selection.pages.isEmpty else {
+            if selectionSide == side { clearMatch() }
+            return
+        }
+        selectionSide = side
+        let spans = PDFTextAlignment.spans(in: selection, document: document)
+        let corresponding = alignment.corresponding(to: spans, fromOriginal: side == .original)
+        let other: Side = side == .original ? .chinese : .original
+        let next = corresponding.isEmpty ? nil : Match(side: other, spans: corresponding)
+        guard next != match else { return }
+        if let page = corresponding.first?.page {
+            if other == .original { originalPage = page } else { chinesePage = page }
+        }
+        match = next
+    }
+
+    func clearMatch() {
+        selectionSide = nil
+        if match != nil { match = nil }
+    }
 
     func show(_ index: Int, on side: Side) {
         guard let doc = document(side), (0..<doc.pageCount).contains(index), index != page(side) else { return }
@@ -124,7 +156,10 @@ struct ReaderView: View {
         }
         .onChange(of: originalRequest) { if $0 != nil { reader.mode = .original } }
         .onChange(of: reader.sync) { enabled in if enabled { reader.align() } }
-        .onChange(of: reader.mode) { mode in if mode == .compare && reader.sync { reader.align() } }
+        .onChange(of: reader.mode) { mode in
+            reader.clearMatch()
+            if mode == .compare && reader.sync { reader.align() }
+        }
         .alert("无法导出 PDF", isPresented: Binding(get: { exportError != nil },
                                                  set: { if !$0 { exportError = nil } })) {
             Button("好", role: .cancel) {}
@@ -164,6 +199,11 @@ struct ReaderView: View {
                             .toggleStyle(.checkbox)
                             .font(.system(size: 11))
                             .help("优先根据 PDF 书签匹配章节，缺少对应书签时按页数比例定位。")
+                        if reader.alignment != nil {
+                            Image(systemName: "highlighter").foregroundStyle(Palette.teal)
+                                .help("拖选任一侧的正文，另一侧会高亮对应句段")
+                                .accessibilityLabel("双语选区联动高亮")
+                        }
                     }
                 } else {
                     Label("已保存原文", systemImage: "doc.text")
@@ -274,9 +314,10 @@ struct ReaderView: View {
             .padding(.vertical, 9)
             .background(Color(red: 0.92, green: 0.94, blue: 0.91))
             if let document = reader.document(side) {
-                PDFCanvas(document: document, page: page, zoom: zoom) {
-                    reader.show($0, on: side)
-                }
+                let spans = reader.mode == .compare && reader.match?.side == side ? reader.match?.spans ?? [] : []
+                PDFCanvas(document: document, page: page, zoom: zoom, highlights: spans,
+                          moved: { reader.show($0, on: side) },
+                          selected: { reader.selected($0, on: side) })
             } else {
                 Text("本机 PDF 文件无法打开")
                     .foregroundStyle(Palette.muted)
@@ -303,7 +344,9 @@ private struct PDFCanvas: NSViewRepresentable {
     let document: PDFDocument
     let page: Int
     let zoom: CGFloat
+    let highlights: [PDFTextSpan]
     let moved: (Int) -> Void
+    let selected: (PDFSelection?) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -321,28 +364,65 @@ private struct PDFCanvas: NSViewRepresentable {
 
     func updateNSView(_ view: ReaderPDFView, context: Context) {
         context.coordinator.moved = moved
-        if view.document !== document { view.document = document }
+        context.coordinator.selected = selected
+        if view.document !== document {
+            view.document = document
+            context.coordinator.lastHighlights = []
+        }
         view.zoom = zoom
         view.needsLayout = true
         if let destination = document.page(at: page), view.currentPage !== destination { view.go(to: destination) }
+        if context.coordinator.lastHighlights != highlights {
+            context.coordinator.lastHighlights = highlights
+            let selections = highlights.compactMap { span -> PDFSelection? in
+                guard let page = document.page(at: span.page), span.range.location >= 0, span.range.length > 0,
+                      span.range.location <= page.numberOfCharacters,
+                      span.range.length <= page.numberOfCharacters - span.range.location,
+                      let selection = page.selection(for: span.range) else { return nil }
+                selection.color = NSColor.systemOrange.withAlphaComponent(0.48)
+                return selection
+            }
+            view.highlightedSelections = selections
+            if let first = selections.first, let page = first.pages.first {
+                let bounds = first.selectionsByLine().first?.bounds(for: page) ?? first.bounds(for: page)
+                if !bounds.isEmpty, !view.bounds.intersects(view.convert(bounds, from: page)) {
+                    view.go(to: bounds, on: page)
+                }
+            }
+        }
     }
 
     final class Coordinator {
         var moved: ((Int) -> Void)?
-        private var observer: NSObjectProtocol?
+        var selected: ((PDFSelection?) -> Void)?
+        var lastHighlights: [PDFTextSpan] = []
+        private var observers: [NSObjectProtocol] = []
+        private var selectionUpdate: DispatchWorkItem?
 
         func observe(_ view: PDFView) {
-            observer = NotificationCenter.default.addObserver(forName: .PDFViewPageChanged, object: view, queue: .main) {
+            let page = NotificationCenter.default.addObserver(forName: .PDFViewPageChanged, object: view, queue: .main) {
                 [weak self, weak view] _ in
                 DispatchQueue.main.async {
                     guard let view, let document = view.document, let page = view.currentPage else { return }
                     self?.moved?(document.index(for: page))
                 }
             }
+            let selection = NotificationCenter.default.addObserver(forName: .PDFViewSelectionChanged, object: view, queue: .main) {
+                [weak self, weak view] _ in
+                self?.selectionUpdate?.cancel()
+                let work = DispatchWorkItem { [weak self, weak view] in
+                    guard let view else { return }
+                    self?.selected?(view.currentSelection)
+                }
+                self?.selectionUpdate = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.09, execute: work)
+            }
+            observers = [page, selection]
         }
 
         deinit {
-            if let observer { NotificationCenter.default.removeObserver(observer) }
+            selectionUpdate?.cancel()
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
         }
     }
 }

@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreText
 import Foundation
 import PDFKit
 
@@ -16,6 +17,7 @@ struct PaperCoreTests {
             try await tests.testCatalogAPI()
             try await tests.testAPIKeyRotation()
             try tests.testRewriteMultifilePaper()
+            try tests.testPDFTextAlignment()
             try await tests.testCompileRetryUsesSavedTranslation()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
             print("All smoke tests passed.")
@@ -277,6 +279,55 @@ struct PaperCoreTests {
         expectTrue(translated.contains(#"\includegraphics[width=0.5\textwidth]{chart}"#))
         expectTrue(translated.contains(#"\begin{equation}x = y \label{eq:a}\end{equation}"#))
         expectTrue(translated.contains(#"\cmidrule(lr){1-1}\cmidrule[.3pt](lr{.75em}){2-2}"#))
+    }
+
+    func testPDFTextAlignment() throws {
+        let folder = try temp()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        func document(_ name: String, pages: [[String]]) throws -> PDFDocument {
+            let url = folder.appendingPathComponent(name + ".pdf")
+            var box = CGRect(x: 0, y: 0, width: 420, height: 280)
+            let context = try unwrap(CGContext(url as CFURL, mediaBox: &box, nil))
+            for lines in pages {
+                context.beginPDFPage(nil)
+                for (index, text) in lines.enumerated() {
+                    let font = CTFontCreateWithName("PingFang SC" as CFString, 14, nil)
+                    let line = CTLineCreateWithAttributedString(NSAttributedString(
+                        string: text, attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
+                    ))
+                    context.textPosition = CGPoint(x: 20, y: 240 - index * 28)
+                    CTLineDraw(line, context)
+                }
+                context.endPDFPage()
+            }
+            context.closePDF()
+            return try unwrap(PDFDocument(url: url))
+        }
+        let repeated = "An ambiguous sentence appears twice."
+        let original = try document("en", pages: [
+            ["The model eval-", "uates visual reasoning.", repeated],
+            [repeated]
+        ])
+        let chinese = try document("zh", pages: [
+            ["导言"],
+            ["该模型评估视觉推理。", "这个句子有两个副本。"]
+        ])
+        let index = try PDFTextAlignment.build([
+            ReadingPair(original: ["The model evaluates visual reasoning."], chinese: ["该模型评估视觉推理。"]),
+            ReadingPair(original: [repeated], chinese: ["这个句子有两个副本。"])
+        ], original: original, chinese: chinese)
+        expectEqual(index.entries.count, 1)
+        let page = try unwrap(original.page(at: 0))
+        let selected = try unwrap(page.selection(for: NSRange(location: 4, length: 5)))
+        let forward = index.corresponding(to: PDFTextAlignment.spans(in: selected, document: original), fromOriginal: true)
+        expectEqual(forward.first?.page, 1)
+        let translatedPage = try unwrap(chinese.page(at: 1))
+        let target = try unwrap(forward.first)
+        let highlighted = try unwrap(translatedPage.selection(for: target.range))
+        expectTrue(highlighted.string?.contains("视觉推理") == true)
+        let backward = index.corresponding(to: PDFTextAlignment.spans(in: highlighted, document: chinese), fromOriginal: false)
+        expectEqual(backward.first?.page, 0)
+        print("VERIFIED two-way PDF selection alignment across different pages and line wraps")
     }
 
     func testCompileRetryUsesSavedTranslation() async throws {

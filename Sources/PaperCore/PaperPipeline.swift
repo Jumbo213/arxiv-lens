@@ -148,7 +148,8 @@ public enum PaperPipeline {
         var completed = 0
         var untranslated = 0
         var context = ""
-        var cache: [String: String] = [:]
+        var cache: [String: TranslationAPI.Excerpt] = [:]
+        var readingPairs: [ReadingPair] = []
         let font = NSFont(name: "Songti SC", size: 12) != nil ? "Songti SC" : "Heiti SC"
         for draft in project.drafts {
             var start = 0
@@ -157,7 +158,7 @@ public enum PaperPipeline {
                 try Task.checkCancellation()
                 var end = start
                 var budget = 0
-                while end < draft.units.count && end - start < 12 {
+                while end < draft.units.count && end - start < 24 {
                     let size = draft.units[end].prompt.utf16.count
                     if end > start && budget + size > 5300 { break }
                     budget += size
@@ -170,7 +171,7 @@ public enum PaperPipeline {
                 let missing = zip(units, batch).compactMap { $1 == nil ? $0 : nil }
                 if !missing.isEmpty {
                     var replies = try await api.translate(missing[...], title: title, context: context)
-                    if replies.contains(nil) {
+                    if replies.contains(where: { $0 == nil }) {
                         // Retry only the affected excerpts. Keep a failed unit in
                         // its original language rather than applying broken TeX.
                         let failed = replies.indices.filter { replies[$0] == nil }
@@ -196,12 +197,15 @@ public enum PaperPipeline {
                         // Restored output depends on the actual tokens, so only
                         // cache excerpts that do not have placeholders.
                         if unit.tokens.isEmpty { cache[unit.prompt] = value }
+                        readingPairs.append(ReadingPair(original: TranslationUnit.readingFragments(unit.prompt),
+                                                        chinese: value.fragments))
                     } else {
                         untranslated += 1
                     }
                 }
-                translations += batch
-                context = String((context + "\n" + batch.compactMap { $0 }.joined(separator: "\n")).suffix(1400))
+                let tex = batch.map { $0?.tex }
+                translations += tex
+                context = String((context + "\n" + tex.compactMap { $0 }.joined(separator: "\n")).suffix(1400))
                 completed += units.count
                 start = end
             }
@@ -215,7 +219,7 @@ public enum PaperPipeline {
         guard project.root.path.hasPrefix(sourceRoot) else { throw LensError("无法定位译稿中的主 TeX 文件。") }
         let draft = Draft(paper: paper, originalID: originalPaper.id,
                           rootPath: String(project.root.path.dropFirst(sourceRoot.count)))
-        let folder = try save(draft, from: source, workspace: workspace, support: support)
+        let folder = try save(draft, from: source, readingPairs: readingPairs, workspace: workspace, support: support)
         return try await compile(draft, from: folder, original: originalPaper, support: support,
                                  workspace: workspace, bin: bin, report: report)
     }
@@ -242,7 +246,8 @@ public enum PaperPipeline {
         }.sorted { $0.draft.paper.completedAt > $1.draft.paper.completedAt }
     }
 
-    private static func save(_ draft: Draft, from source: URL, workspace: URL, support: URL) throws -> URL {
+    private static func save(_ draft: Draft, from source: URL, readingPairs: [ReadingPair], workspace: URL,
+                             support: URL) throws -> URL {
         let fm = FileManager.default
         let staging = workspace.appendingPathComponent("draft", isDirectory: true)
         let parent = draftDirectory(for: draft.paper, in: support)
@@ -250,6 +255,7 @@ public enum PaperPipeline {
         try fm.createDirectory(at: staging, withIntermediateDirectories: false)
         try fm.moveItem(at: source, to: staging.appendingPathComponent("source", isDirectory: true))
         try JSONEncoder().encode(draft).write(to: staging.appendingPathComponent("draft.json"), options: .atomic)
+        try JSONEncoder().encode(readingPairs).write(to: staging.appendingPathComponent("reading-pairs.json"), options: .atomic)
         try fm.createDirectory(at: parent, withIntermediateDirectories: true)
         try fm.moveItem(at: staging, to: destination)
         return destination
@@ -274,11 +280,13 @@ public enum PaperPipeline {
         await report(JobProgress("本机编译中文版", "保留论文模板、图表、公式和交叉引用", 0.88))
         let log = result.appendingPathComponent("compile.log")
         let compiled: URL
+        let translatedPDF: PDFDocument
         do {
             compiled = try await LocalTeX.compile(root: root, workspace: workspace, bin: bin, log: log)
-            guard let translatedPDF = PDFDocument(url: compiled), translatedPDF.pageCount > 0 else {
+            guard let document = PDFDocument(url: compiled), document.pageCount > 0 else {
                 throw LensError("XeLaTeX 没有生成可读的 PDF。")
             }
+            translatedPDF = document
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -290,6 +298,17 @@ public enum PaperPipeline {
                                  logURL: fm.fileExists(atPath: failure.path) ? failure : nil)
         }
         try fm.copyItem(at: compiled, to: result.appendingPathComponent("chinese.pdf"))
+        if let originalPDF = PDFDocument(url: result.appendingPathComponent("original.pdf")),
+           let data = try? Data(contentsOf: folder.appendingPathComponent("reading-pairs.json")),
+           let pairs = try? JSONDecoder().decode([ReadingPair].self, from: data) {
+            await report(JobProgress("建立双语对照索引", draft.paper.title, 0.96))
+            let index = try PDFTextAlignment.build(pairs, original: originalPDF, chinese: translatedPDF)
+            if !index.entries.isEmpty {
+                // Reading aids are optional. Keep a usable PDF if writing the
+                // index fails, just as with editions from earlier releases.
+                try? JSONEncoder().encode(index).write(to: result.appendingPathComponent("alignment.json"), options: .atomic)
+            }
+        }
         let paper = Paper(id: draft.paper.id, arxivID: draft.paper.arxivID, title: draft.paper.title, completedAt: .now,
                           untranslated: draft.paper.untranslated, metadata: draft.paper.metadata)
         try Task.checkCancellation()

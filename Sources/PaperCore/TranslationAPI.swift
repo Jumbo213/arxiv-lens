@@ -233,8 +233,13 @@ struct TranslationAPI: Sendable {
         return content
     }
 
+    struct Excerpt: Sendable {
+        let tex: String
+        let fragments: [String]
+    }
+
     func translate(_ units: ArraySlice<TranslationUnit>, title: String, context: String,
-                   retry: Bool = false) async throws -> [String?] {
+                   retry: Bool = false) async throws -> [Excerpt?] {
         let system = """
         你是负责英文学术论文中译的科研编辑。将 excerpts 逐条译成严谨、自然、可供科研阅读的简体中文论文正文。
         保留原文论证与信息范围，准确区分假设、相关性、因果结论、作者推测和实验观察。
@@ -265,7 +270,10 @@ struct TranslationAPI: Sendable {
         let reply = try await ask(system: system, user: String(decoding: data, as: UTF8.self), json: true)
         guard let translations = try? JSONDecoder().decode([String: String].self, from: Self.jsonData(reply))
         else { return Array(repeating: nil, count: units.count) }
-        return zip(units, ids).map { unit, id in translations[id].flatMap(unit.restore) }
+        return zip(units, ids).map { unit, id in
+            guard let text = translations[id], let tex = unit.restore(text) else { return nil }
+            return Excerpt(tex: tex, fragments: TranslationUnit.readingFragments(text))
+        }
     }
 
     static func jsonData(_ reply: String) -> Data {

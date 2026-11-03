@@ -43,6 +43,13 @@ struct TranslationUnit: Sendable {
 
     static func endsInControlWord(_ text: String) -> Bool { !controlWordAtEnd.matches(text).isEmpty }
 
+    static func readingFragments(_ text: String) -> [String] {
+        text.replacingOccurrences(of: marker.pattern, with: "\u{001F}", options: .regularExpression)
+            .split(separator: "\u{001F}")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
     var numericTokens: [Int: String] {
         Dictionary(uniqueKeysWithValues: tokens.enumerated().compactMap { index, value in
             value.range(of: #"\A[+-]?\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?(?:\\%)?\z"#,
@@ -194,7 +201,7 @@ struct TeXProject {
                 }
             }
             let bodyStart = start.map(NSMaxRange) ?? 0
-            scanner.scan(from: bodyStart, to: max(bodyStart, end))
+            scanner.scan(from: bodyStart, to: max(bodyStart, end), sentenceUnits: true)
             drafts.append(TeXDraft(url: url, content: content, units: scanner.units,
                                    documentOffset: url == root ? start?.location : nil))
 
