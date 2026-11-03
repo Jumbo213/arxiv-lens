@@ -22,6 +22,15 @@ struct PaperCoreTests {
     }
 
     func testArxivLinkAndEndpointNormalization() throws {
+        for preset in APIProviderPreset.presets {
+            let connection = try APIConnection(url: preset.url, key: "fixture")
+            expectTrue(connection.endpoint.path.hasSuffix("/chat/completions"))
+            expectTrue(connection.modelsURL.path.hasSuffix("/models"))
+        }
+        let presetEndpoint = try APIConnection.chatEndpoint(for: "https://api.openai.com/v1")
+        expectEqual(presetEndpoint, try APIConnection.chatEndpoint(for: "https://api.openai.com/v1/chat/completions"))
+        expectEqual(try APIConnection.chatEndpoint(for: "https://api.deepseek.com/chat/completions").path,
+                    "/chat/completions")
         let root = try APIConnection(url: "https://example.com", key: "test")
         expectEqual(root.modelsURL.path, "/v1/models")
         let prefixed = try APIConnection(url: "https://example.com/proxy/v1/chat/completions/?region=us", key: "test")

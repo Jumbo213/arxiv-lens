@@ -23,7 +23,7 @@ public struct APIConnection: Hashable, Sendable {
     let key: String
     public var hasKey: Bool { !key.isEmpty }
 
-    public init(url: String, key: String) throws {
+    public static func chatEndpoint(for url: String) throws -> URL {
         let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: url), let host = components.host?.lowercased(), !host.isEmpty,
               components.user == nil, components.password == nil, components.fragment == nil,
@@ -41,6 +41,15 @@ public struct APIConnection: Hashable, Sendable {
             components.percentEncodedPath = normalized
         }
         guard let endpoint = components.url else { throw LensError("API 地址格式有误。") }
+        return endpoint
+    }
+
+    public init(url: String, key: String) throws {
+        let endpoint = try Self.chatEndpoint(for: url)
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            throw LensError("API 地址格式有误。")
+        }
+        let host = components.host?.lowercased() ?? ""
         let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty || ["localhost", "127.0.0.1", "[::1]", "::1"].contains(host) else {
             throw LensError("请填写 API Key。")

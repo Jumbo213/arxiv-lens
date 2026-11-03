@@ -49,7 +49,23 @@ struct SettingsView: View {
             }
             Divider()
             field("API URL") {
-                TextField("https://api.example.com/v1", text: $endpoint)
+                HStack(spacing: 8) {
+                    TextField("https://api.example.com/v1", text: $endpoint)
+                    Menu("服务商预设") {
+                        ForEach(APIProviderPreset.presets) { preset in
+                            Button { apply(preset) } label: {
+                                if isCurrent(preset) {
+                                    Label(preset.name, systemImage: "checkmark")
+                                } else {
+                                    Text(preset.name)
+                                }
+                            }
+                        }
+                    }
+                    .fixedSize()
+                    .disabled(checking)
+                    .help("填入服务商的 API 地址")
+                }
             }
             field("API Key") {
                 SecureField("输入服务商的 API Key", text: Binding(
@@ -135,6 +151,21 @@ struct SettingsView: View {
         .task(id: modelRequest) { await fetchModels(modelRequest) }
         .onDisappear { checkTask?.cancel() }
         .sheet(isPresented: $glossaryOpen) { GlossaryView() }
+    }
+
+    private func isCurrent(_ preset: APIProviderPreset) -> Bool {
+        guard let current = try? APIConnection.chatEndpoint(for: endpoint) else { return false }
+        return current == (try? APIConnection.chatEndpoint(for: preset.url))
+    }
+
+    private func apply(_ preset: APIProviderPreset) {
+        if !isCurrent(preset) {
+            key = ""
+            model = ""
+            allowedModelURL = nil
+            status = ""
+        }
+        endpoint = preset.url
     }
 
     private var modelControls: some View {
