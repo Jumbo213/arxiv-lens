@@ -136,11 +136,30 @@ struct PaperCoreTests {
         defer { try? FileManager.default.removeItem(at: support) }
         let ids = environment["ARXIV_LENS_TEST_PAPERS"]?.split(separator: ",").map(String.init) ?? ["1706.03762"]
         for id in ids {
-            let paper = try await PaperPipeline.run(input: id, settings: settings, support: support) { progress in
+            let download = try await PaperPipeline.run(input: id, settings: nil, support: support) { progress in
+                print("\(progress.title) \(progress.detail)")
+            }
+            let downloadedFolder = download.directory(in: support)
+            let downloadedPDF = downloadedFolder.appendingPathComponent("original.pdf")
+            expectTrue(!download.hasTranslation)
+            expectTrue(FileManager.default.fileExists(atPath: downloadedPDF.path))
+            expectTrue(!FileManager.default.fileExists(atPath: downloadedFolder.appendingPathComponent("source").path))
+            expectTrue(!FileManager.default.fileExists(atPath: downloadedFolder.appendingPathComponent("chinese.pdf").path))
+            expectTrue(Paper.history(in: support).contains(download))
+            if try ArxivID(download.arxivID).isVersioned {
+                let cached = try await PaperPipeline.run(input: download.arxivID, settings: nil, support: support) { _ in }
+                expectEqual(cached, download)
+            }
+            print("VERIFIED download-only record \(download.arxivID)")
+
+            let paper = try await PaperPipeline.run(input: download.arxivID, settings: settings, support: support) { progress in
                 print("\(progress.title) \(progress.detail)")
             }
             let folder = support.appendingPathComponent("Papers/\(paper.id.uuidString)")
-            let original = try unwrap(PDFDocument(url: folder.appendingPathComponent("original.pdf")))
+            let translatedOriginal = folder.appendingPathComponent("original.pdf")
+            expectEqual(try Data(contentsOf: translatedOriginal), try Data(contentsOf: downloadedPDF))
+            expectTrue(paper.hasTranslation)
+            let original = try unwrap(PDFDocument(url: translatedOriginal))
             let chinese = try unwrap(PDFDocument(url: folder.appendingPathComponent("chinese.pdf")))
             expectGreaterThan(original.pageCount, 0)
             expectGreaterThan(chinese.pageCount, 0)
@@ -148,6 +167,9 @@ struct PaperCoreTests {
             expectEqual(paper.untranslated, 0)
             let persisted = try JSONDecoder().decode(Paper.self, from: Data(contentsOf: folder.appendingPathComponent("paper.json")))
             expectEqual(persisted, paper)
+            let legacyJSON = try JSONEncoder().encode(paper)
+            expectTrue(!String(decoding: legacyJSON, as: UTF8.self).contains("downloadOnly"))
+            expectTrue(Paper.history(in: support).contains(persisted))
             print("VERIFIED \(paper.arxivID) \(paper.title) · pages \(original.pageCount) → \(chinese.pageCount)")
             if let output = environment["ARXIV_LENS_TEST_COPY_TO"] {
                 let destination = URL(fileURLWithPath: output, isDirectory: true)

@@ -36,6 +36,8 @@ public struct ArxivID: Hashable, Sendable {
         value.replacingOccurrences(of: #"v[0-9]+$"#, with: "", options: .regularExpression).lowercased()
     }
 
+    var isVersioned: Bool { value.range(of: #"v[0-9]+$"#, options: .regularExpression) != nil }
+
     public var abstractURL: URL { url("abs") }
     func url(_ type: String) -> URL { URL(string: "https://arxiv.org/\(type)/\(value)")! }
 }
@@ -46,17 +48,35 @@ public struct Paper: Codable, Identifiable, Hashable, Sendable {
     public let title: String
     public let completedAt: Date
     public let untranslated: Int
+    private let downloadOnly: Bool?
+    public var hasTranslation: Bool { downloadOnly != true }
+
+    init(id: UUID, arxivID: String, title: String, completedAt: Date, untranslated: Int, downloadOnly: Bool? = nil) {
+        self.id = id
+        self.arxivID = arxivID
+        self.title = title
+        self.completedAt = completedAt
+        self.untranslated = untranslated
+        self.downloadOnly = downloadOnly
+    }
+
     public var paperID: String { (try? ArxivID(arxivID).paperID) ?? arxivID }
     public var originalURL: URL { directory.appendingPathComponent("original.pdf") }
     public var translationURL: URL { directory.appendingPathComponent("chinese.pdf") }
     public var sourceURL: URL { directory.appendingPathComponent("source", isDirectory: true) }
-    public var directory: URL { Self.library.appendingPathComponent(id.uuidString, isDirectory: true) }
+    public var directory: URL { directory(in: Self.support) }
+
+    func directory(in support: URL) -> URL {
+        Self.library(in: support).appendingPathComponent(id.uuidString, isDirectory: true)
+    }
 
     public static var support: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ArxivLens", isDirectory: true)
     }
-    public static var library: URL { support.appendingPathComponent("Papers", isDirectory: true) }
+    public static var library: URL { library(in: support) }
+
+    static func library(in support: URL) -> URL { support.appendingPathComponent("Papers", isDirectory: true) }
 
     public struct HistoryEntry: Identifiable, Sendable {
         public let id: String
@@ -74,14 +94,17 @@ public struct Paper: Codable, Identifiable, Hashable, Sendable {
         }
     }
 
-    public static func history() -> [Paper] {
-        let directories = (try? FileManager.default.contentsOfDirectory(at: library, includingPropertiesForKeys: nil)) ?? []
+    public static func history() -> [Paper] { history(in: support) }
+
+    static func history(in support: URL) -> [Paper] {
+        let fm = FileManager.default
+        let directories = (try? fm.contentsOfDirectory(at: library(in: support), includingPropertiesForKeys: nil)) ?? []
         return directories.compactMap { dir in
             guard let data = try? Data(contentsOf: dir.appendingPathComponent("paper.json")),
                   let paper = try? JSONDecoder().decode(Self.self, from: data),
                   paper.id.uuidString == dir.lastPathComponent,
-                  FileManager.default.fileExists(atPath: paper.originalURL.path),
-                  FileManager.default.fileExists(atPath: paper.translationURL.path) else { return nil }
+                  fm.fileExists(atPath: dir.appendingPathComponent("original.pdf").path),
+                  !paper.hasTranslation || fm.fileExists(atPath: dir.appendingPathComponent("chinese.pdf").path) else { return nil }
             return paper
         }.sorted { $0.completedAt > $1.completedAt }
     }

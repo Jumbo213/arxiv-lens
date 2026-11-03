@@ -24,7 +24,10 @@ struct ArxivLensApp: App {
                     .keyboardShortcut(",", modifiers: .command)
             }
             CommandGroup(after: .newItem) {
-                Button("翻译 arXiv 论文") { store.start() }
+                Button("仅下载 arXiv 原文") { store.start(downloadOnly: true) }
+                    .keyboardShortcut(.return, modifiers: [.command, .shift])
+                    .disabled(store.job != nil || store.input.isEmpty)
+                Button("下载并翻译 arXiv 论文") { store.start() }
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(store.job != nil || store.input.isEmpty)
             }
@@ -69,7 +72,8 @@ enum Keychain {
 @MainActor
 final class LibraryStore: ObservableObject {
     @Published var input = ""
-    @Published var selected: Paper?
+    @Published private(set) var selected: Paper?
+    @Published private(set) var originalRequest: UUID?
     @Published var papers = Paper.history()
     @Published var settingsOpen = false
     @Published var job: JobProgress?
@@ -79,36 +83,50 @@ final class LibraryStore: ObservableObject {
 
     init() { selected = papers.first }
 
-    func start() {
+    func select(_ paper: Paper, original: Bool = false) {
+        originalRequest = original ? UUID() : nil
+        selected = paper
+    }
+
+    func start(downloadOnly: Bool = false, paper: Paper? = nil) {
         guard task == nil else { return }
-        do { _ = try ArxivID(input) }
+        let link = paper?.arxivID ?? input
+        do { _ = try ArxivID(link) }
         catch { failure = error.localizedDescription; return }
 
-        let defaults = UserDefaults.standard
-        let endpoint = defaults.string(forKey: "endpoint") ?? ""
-        let model = defaults.string(forKey: "model") ?? ""
-        let settings: TranslationSettings
-        do {
-            settings = try TranslationSettings(url: endpoint, model: model, key: Keychain.read(),
-                glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "",
-                lineSpacing: LineSpacing(rawValue: defaults.string(forKey: "lineSpacing") ?? "") ?? .comfortable)
-        } catch {
-            settingsOpen = true
-            return
+        let settings: TranslationSettings?
+        if downloadOnly {
+            settings = nil
+        } else {
+            let defaults = UserDefaults.standard
+            do {
+                settings = try TranslationSettings(url: defaults.string(forKey: "endpoint") ?? "",
+                    model: defaults.string(forKey: "model") ?? "", key: Keychain.read(),
+                    glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "",
+                    lineSpacing: LineSpacing(rawValue: defaults.string(forKey: "lineSpacing") ?? "") ?? .comfortable)
+            } catch {
+                settingsOpen = true
+                return
+            }
         }
 
-        let link = input
-        job = JobProgress.starting
+        job = JobProgress(title: downloadOnly ? "准备下载" : "准备翻译", detail: "正在启动任务", fraction: 0)
         task = Task { [weak self] in
             guard let self else { return }
             defer { self.task = nil; self.job = nil; self.cancelling = false }
             do {
-                let paper = try await PaperPipeline.run(input: link, settings: settings) { [weak self] status in
+                let report: @Sendable (JobProgress) async -> Void = { [weak self] status in
                     await self?.update(status)
                 }
+                let result: Paper
+                if let settings {
+                    result = try await PaperPipeline.run(input: link, settings: settings, report: report)
+                } else {
+                    result = try await PaperPipeline.download(input: link, report: report)
+                }
                 papers = Paper.history()
-                selected = paper
-                if input == link { input = "" }
+                select(result, original: downloadOnly)
+                if paper == nil, input == link { input = "" }
             } catch {
                 if !Task.isCancelled { failure = error.localizedDescription }
             }
@@ -121,8 +139,4 @@ final class LibraryStore: ObservableObject {
         cancelling = true
         task?.cancel()
     }
-}
-
-private extension JobProgress {
-    static var starting: Self { .init(title: "准备翻译", detail: "正在启动任务", fraction: 0) }
 }

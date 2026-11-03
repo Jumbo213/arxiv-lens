@@ -1,13 +1,13 @@
 # Arxiv Lens
 
-Arxiv Lens 是一个原生 macOS 论文翻译与阅读器。粘贴 arXiv 链接，应用会获取对应版本的 TeX 源码和 arXiv 发布的 PDF，通过你配置的模型将论文正文译成简体中文，再用本机 XeLaTeX 排版。历史按论文原始标题显示，可以按标题或 arXiv 编号搜索。同一 arXiv 论文的译本合并显示，默认打开最新译本；可以从「文件 → 此文献的译本」切换。
+Arxiv Lens 是一个原生 macOS 论文翻译与阅读器。粘贴 arXiv 链接，可以只保存原版 PDF，或下载对应版本的 TeX 源码、翻译成学术简体中文并用本机 XeLaTeX 排版。历史按论文原始标题显示，可以按标题或 arXiv 编号搜索。同一 arXiv 论文的译本合并显示，默认打开最新译本；可以从「文件 → 此文献的记录」切换。
 
 ## 安装和使用
 
 1. 在 [GitHub Releases](https://github.com/Jumbo213/arxiv-lens/releases) 下载 DMG。打开后将 **Arxiv Lens** 拖到 **Applications**。初版 DMG 为 Apple Silicon（arm64）构建，最低要求 macOS 13。
 2. 安装 [MacTeX](https://www.tug.org/mactex/) 或 [TinyTeX](https://yihui.org/tinytex/)。需要 XeLaTeX、latexmk、xeCJK、etoolbox 和 setspace。精简的 TeX Live 可以使用 `tlmgr install xetex latexmk xecjk etoolbox setspace` 补齐，部分论文还需要额外宏包。
 3. 打开「翻译与 TeX 设置」，填入 API URL、模型 ID、API Key，然后测试 API 和 TeX。TeX bin 留空时自动检测常见安装目录，也可以手动选择。
-4. 粘贴链接或编号，例如 `https://arxiv.org/abs/1706.03762v7`，点击「开始翻译」。完成后可以并排对照、联动翻页、单独阅读或导出任一 PDF。默认收起标题和地址栏，点击「展开顶部」可显示。
+4. 粘贴链接或编号，例如 `https://arxiv.org/abs/1706.03762v7`，可选「仅下载」保存原版 PDF，或点「下载并翻译」生成中文版。仅下载无需配置 API 或安装 TeX，在原文阅读器里可点「翻译这篇论文」继续。完成翻译后可以并排对照、联动翻页、单独阅读或导出任一 PDF。默认收起标题和地址栏，点击「展开顶部」可显示。
 
 API 支持 OpenAI 兼容的 Chat Completions 协议。URL 可以是 `https://服务地址/v1`，也可以是完整的 `https://服务地址/v1/chat/completions`。本机服务可用 `http://127.0.0.1:端口/v1`，并可留空 Key。内置术语表覆盖机器学习、大模型、后训练和神经符号，按当前段落匹配。设置中可以浏览词表，也可添加 `attention mechanism = 注意力机制` 格式的自定义词条来覆盖内置译法。Key 存在 macOS 钥匙串。论文文本片段与术语表会发送给配置的翻译服务。
 

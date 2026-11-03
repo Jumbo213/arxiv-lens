@@ -42,10 +42,12 @@ struct WorkspaceView: View {
                 }
                 if let job = store.job { progress(job) }
                 if let paper = store.selected {
-                    ReaderView(paper: paper, compact: $compactReader,
-                               translations: history.first { $0.id == paper.paperID }?.translations ?? []) {
-                        store.selected = $0
-                    }.id(paper.id)
+                    ReaderView(paper: paper, compact: $compactReader, originalRequest: store.originalRequest,
+                               translations: history.first { $0.id == paper.paperID }?.translations ?? [],
+                               busy: store.job != nil,
+                               selectTranslation: { store.select($0) },
+                               translate: { store.start(paper: paper) })
+                        .id(paper.id)
                 } else {
                     emptyState
                 }
@@ -105,7 +107,7 @@ struct WorkspaceView: View {
             .padding(.horizontal, 15)
 
             HStack {
-                Text("翻译历史").font(.system(size: 11, weight: .semibold))
+                Text("文献库").font(.system(size: 11, weight: .semibold))
                 Spacer()
                 Text("\(history.count)").font(.system(size: 10, design: .monospaced))
                     .padding(.horizontal, 6).padding(.vertical, 2)
@@ -120,8 +122,9 @@ struct WorkspaceView: View {
                 LazyVStack(spacing: 5) {
                     ForEach(filtered) { entry in
                         let paper = entry.latest
+                        let translationCount = entry.translations.filter(\.hasTranslation).count
                         let active = entry.id == store.selected?.paperID
-                        Button { store.selected = paper } label: {
+                        Button { store.select(paper) } label: {
                             HStack(alignment: .top, spacing: 9) {
                                 Image(systemName: "doc.text").font(.system(size: 12))
                                     .foregroundStyle(active ? Palette.mint : Palette.soft).padding(.top, 2)
@@ -133,8 +136,10 @@ struct WorkspaceView: View {
                                     HStack(spacing: 7) {
                                         Text(paper.arxivID)
                                             .font(.system(size: 10, design: .monospaced))
-                                        if entry.translations.count > 1 {
-                                            Text("\(entry.translations.count) 个译本").font(.system(size: 10))
+                                        if !paper.hasTranslation {
+                                            Text("仅原文").font(.system(size: 10))
+                                        } else if translationCount > 1 {
+                                            Text("\(translationCount) 个译本").font(.system(size: 10))
                                         }
                                     }
                                     .foregroundStyle(Palette.soft)
@@ -149,7 +154,7 @@ struct WorkspaceView: View {
                         .help(paper.title)
                     }
                     if filtered.isEmpty {
-                        Text(search.isEmpty ? "译完的论文会按标题显示在这里" : "没有匹配的论文")
+                        Text(search.isEmpty ? "下载或译完的论文会显示在这里" : "没有匹配的论文")
                             .font(.system(size: 11)).foregroundStyle(Palette.soft)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(9)
                     }
@@ -185,12 +190,19 @@ struct WorkspaceView: View {
             .padding(11)
             .background(.white.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(linkFocused ? Palette.teal.opacity(0.6) : Palette.line))
+            let disabled = store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.job != nil
+            Button { store.start(downloadOnly: true) } label: {
+                Label("仅下载", systemImage: "arrow.down")
+            }
+            .controlSize(.large)
+            .disabled(disabled)
+            .help("保存原版 PDF  ⇧⌘↩")
             Button { store.start() } label: {
-                Label("开始翻译", systemImage: "sparkle")
+                Label("下载并翻译", systemImage: "sparkle")
             }
             .buttonStyle(PrimaryButton())
-            .disabled(store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.job != nil)
-            .help("开始翻译  ⌘↩")
+            .disabled(disabled)
+            .help("获取 TeX 源码并生成中文版  ⌘↩")
         }
         .padding(.horizontal, 22)
         .padding(.top, 34)
@@ -231,7 +243,7 @@ struct WorkspaceView: View {
             .padding(.bottom, 26)
             Text("读懂下一篇论文")
                 .font(.system(size: 32, weight: .semibold, design: .serif))
-            Text("从 arXiv 源码生成中文版 PDF，在同一个窗口对照阅读。")
+            Text("从 arXiv 保存原文，或生成中文版 PDF 对照阅读。")
                 .font(.system(size: 14)).foregroundStyle(Palette.muted)
                 .padding(.top, 12)
             HStack(spacing: 7) {
@@ -283,7 +295,7 @@ private struct ErrorSheet: View {
     let message: String
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Label("翻译任务未完成", systemImage: "exclamationmark.circle")
+            Label("论文任务未完成", systemImage: "exclamationmark.circle")
                 .font(.title2.weight(.semibold))
             ScrollView {
                 Text(message).font(.system(size: 12)).textSelection(.enabled)

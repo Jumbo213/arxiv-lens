@@ -6,12 +6,12 @@ import UniformTypeIdentifiers
 
 private enum Side {
     case original, chinese
-    var name: String { self == .original ? "英文原版" : "中文译文" }
+    var name: String { self == .original ? "原版 PDF" : "中文译文" }
 }
 
 private enum ReadingMode: String, CaseIterable {
     case compare = "对照阅读"
-    case original = "英文原版"
+    case original = "原版 PDF"
     case chinese = "中文译文"
 }
 
@@ -24,9 +24,10 @@ private final class ReaderState: ObservableObject {
     @Published var chinesePage = 0
     private var anchors: [(Int, Int)] = []
 
-    init(_ paper: Paper) {
+    init(_ paper: Paper, showOriginal: Bool) {
         original = PDFDocument(url: paper.originalURL)
-        chinese = PDFDocument(url: paper.translationURL)
+        chinese = paper.hasTranslation ? PDFDocument(url: paper.translationURL) : nil
+        mode = showOriginal || !paper.hasTranslation ? .original : .compare
         if let original, let chinese, let left = original.outlineRoot, let right = chinese.outlineRoot {
             let leftPages = Self.outlinePages(left, document: original)
             let rightPages = Self.outlinePages(right, document: chinese)
@@ -82,18 +83,25 @@ private final class ReaderState: ObservableObject {
 struct ReaderView: View {
     let paper: Paper
     @Binding var compact: Bool
+    let originalRequest: UUID?
     let translations: [Paper]
+    let busy: Bool
     let selectTranslation: (Paper) -> Void
+    let translate: () -> Void
     @StateObject private var reader: ReaderState
     @ViewState private var zoom: CGFloat = 1
     @ViewState private var exportError: String?
 
-    init(paper: Paper, compact: Binding<Bool>, translations: [Paper], selectTranslation: @escaping (Paper) -> Void) {
+    init(paper: Paper, compact: Binding<Bool>, originalRequest: UUID?, translations: [Paper], busy: Bool,
+         selectTranslation: @escaping (Paper) -> Void, translate: @escaping () -> Void) {
         self.paper = paper
         _compact = compact
+        self.originalRequest = originalRequest
         self.translations = translations
+        self.busy = busy
         self.selectTranslation = selectTranslation
-        _reader = StateObject(wrappedValue: ReaderState(paper))
+        self.translate = translate
+        _reader = StateObject(wrappedValue: ReaderState(paper, showOriginal: originalRequest != nil))
     }
 
     var body: some View {
@@ -109,6 +117,7 @@ struct ReaderView: View {
                 pane(reader.mode == .original ? .original : .chinese)
             }
         }
+        .onChange(of: originalRequest) { if $0 != nil { reader.mode = .original } }
         .onChange(of: reader.sync) { enabled in if enabled { reader.align() } }
         .onChange(of: reader.mode) { mode in if mode == .compare && reader.sync { reader.align() } }
         .alert("无法导出 PDF", isPresented: Binding(get: { exportError != nil },
@@ -136,19 +145,25 @@ struct ReaderView: View {
                     .help(paper.title)
             }
             HStack(spacing: 9) {
-                Picker("阅读模式", selection: $reader.mode) {
-                    Text("对照").tag(ReadingMode.compare)
-                    Text("原文").tag(ReadingMode.original)
-                    Text("译文").tag(ReadingMode.chinese)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 176)
-                if reader.mode == .compare {
-                    Toggle("联动翻页", isOn: $reader.sync)
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 11))
-                        .help("优先根据 PDF 书签匹配章节，缺少对应书签时按页数比例定位。")
+                if paper.hasTranslation {
+                    Picker("阅读模式", selection: $reader.mode) {
+                        Text("对照").tag(ReadingMode.compare)
+                        Text("原文").tag(ReadingMode.original)
+                        Text("译文").tag(ReadingMode.chinese)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 176)
+                    if reader.mode == .compare {
+                        Toggle("联动翻页", isOn: $reader.sync)
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 11))
+                            .help("优先根据 PDF 书签匹配章节，缺少对应书签时按页数比例定位。")
+                    }
+                } else {
+                    Label("已保存原文", systemImage: "doc.text")
+                        .font(.system(size: 12)).foregroundStyle(Palette.teal)
+                    Button("翻译这篇论文", action: translate).disabled(busy)
                 }
                 Spacer(minLength: 4)
                 if paper.untranslated > 0 {
@@ -182,24 +197,29 @@ struct ReaderView: View {
 
     private var fileMenu: some View {
         Menu {
-            Button("导出英文 PDF…") { export(.original) }
-            Button("导出中文 PDF…") { export(.chinese) }
+            Button("导出原版 PDF…") { export(.original) }
+            if paper.hasTranslation {
+                Button("导出中文 PDF…") { export(.chinese) }
+            }
             if translations.count > 1 {
-                Menu("此文献的译本") {
+                Menu("此文献的记录") {
                     ForEach(translations) { translation in
                         Button {
                             selectTranslation(translation)
                         } label: {
                             let date = translation.completedAt.formatted(.dateTime.month().day().hour().minute().second())
-                            Label("\(translation.arxivID) · \(date)",
+                            let type = translation.hasTranslation ? "译本" : "原文"
+                            Label("\(translation.arxivID) · \(type) · \(date)",
                                   systemImage: translation.id == paper.id ? "checkmark.circle" : "doc")
                         }
                     }
                 }
             }
             Divider()
-            Button("在访达中显示译后 TeX") {
-                NSWorkspace.shared.open(paper.sourceURL)
+            if paper.hasTranslation {
+                Button("在访达中显示译后 TeX") {
+                    NSWorkspace.shared.open(paper.sourceURL)
+                }
             }
             if let id = try? ArxivID(paper.arxivID) {
                 Button("在 arXiv 打开") { NSWorkspace.shared.open(id.abstractURL) }
