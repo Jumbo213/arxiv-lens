@@ -146,6 +146,8 @@ struct LibrarySidebar: View {
                 Menu {
                     Button("AI 分类未整理文献") { classify(history) }
                         .disabled(catalog.working || catalog.loadError != nil || history.allSatisfy { catalog.entries[$0.id] != nil })
+                    Button("刷新缺少发表信息的文献") { refreshPublications(history) }
+                        .disabled(catalog.working || catalog.loadError != nil || !history.contains { catalog.canRefresh($0.id) })
                     if catalog.working { Button("停止整理") { catalog.cancel() } }
                     if let entry = history.first(where: { $0.id == store.selected?.paperID }) {
                         Button("编辑当前文献分类…") { editTarget = entry }
@@ -183,7 +185,7 @@ struct LibrarySidebar: View {
         let filtered = mode == .natural || terms.isEmpty ? history : history.filter { entry in
             let classification = catalog.entries[entry.id]
             let searchable = entry.translations.flatMap { [$0.title, $0.arxivID] }
-                + (classification.map { [$0.category, $0.kind.label] + $0.keywords } ?? [])
+                + (classification.map { [$0.category, $0.kind.label, $0.publicationLabel ?? ""] + $0.keywords } ?? [])
             return terms.allSatisfy { term in searchable.contains { $0.localizedCaseInsensitiveContains(term) } }
         }
         guard !filtered.isEmpty else { return [] }
@@ -240,6 +242,11 @@ struct LibrarySidebar: View {
                         Text([classification.category, classification.kind.label].filter { !$0.isEmpty }.joined(separator: " · "))
                             .font(.system(size: 10)).foregroundStyle(Palette.soft).lineLimit(1)
                     }
+                    if let publication = classification?.publicationLabel {
+                        Label(publication, systemImage: "calendar")
+                            .font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.mint)
+                            .lineLimit(2).help(publication)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -254,6 +261,10 @@ struct LibrarySidebar: View {
                 store.start(paper: paper)
             }.disabled(store.job != nil)
             Button("编辑分类…") { editTarget = entry }.disabled(catalog.loadError != nil)
+            if catalog.canRefresh(entry.id) {
+                Button("刷新发表信息") { refreshPublications([entry]) }
+                    .disabled(catalog.working || catalog.loadError != nil)
+            }
             if classification == nil {
                 Button("用 API 分类") { classify([entry]) }.disabled(catalog.loadError != nil)
             }
@@ -268,6 +279,12 @@ struct LibrarySidebar: View {
     private func classify(_ entries: [Paper.HistoryEntry]) {
         guard let settings = store.apiSettings() else { return }
         catalog.classify(entries, settings: settings)
+    }
+
+    private func refreshPublications(_ entries: [Paper.HistoryEntry]) {
+        let eligible = entries.filter { catalog.canRefresh($0.id) }
+        guard !eligible.isEmpty, let settings = store.apiSettings() else { return }
+        catalog.refreshPublications(eligible, settings: settings)
     }
 
     private func resetSearch() {
@@ -312,6 +329,8 @@ private struct ClassificationEditor: View {
     @ViewState private var category: String
     @ViewState private var keywords: String
     @ViewState private var kind: PublicationKind
+    @ViewState private var venue: String
+    @ViewState private var year: String
     @ViewState private var failure: String?
 
     init(entry: Paper.HistoryEntry, catalog: CatalogStore) {
@@ -321,6 +340,8 @@ private struct ClassificationEditor: View {
         _category = ViewState(initialValue: existing?.category ?? "")
         _keywords = ViewState(initialValue: existing?.keywords.joined(separator: "，") ?? "")
         _kind = ViewState(initialValue: existing?.kind ?? .unknown)
+        _venue = ViewState(initialValue: existing?.venue ?? "")
+        _year = ViewState(initialValue: existing?.publicationYear.map(String.init) ?? "")
     }
 
     var body: some View {
@@ -342,6 +363,12 @@ private struct ClassificationEditor: View {
             Picker("文献类型", selection: $kind) {
                 ForEach(PublicationKind.allCases, id: \.self) { Text($0.label).tag($0) }
             }
+            if kind.showsPublication {
+                HStack(spacing: 8) {
+                    TextField("会议或期刊名称", text: $venue)
+                    TextField("发表年份", text: $year).frame(width: 92)
+                }.textFieldStyle(.roundedBorder)
+            }
             if let failure {
                 Text(failure).font(.system(size: 11)).foregroundStyle(.red)
             } else {
@@ -356,7 +383,14 @@ private struct ClassificationEditor: View {
                 Button("保存") {
                     do {
                         let terms = keywords.components(separatedBy: CharacterSet(charactersIn: ",，、;；"))
-                        try catalog.edit(entry.id, category: category, keywords: terms, kind: kind)
+                        let yearText = year.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let publicationYear = Int(yearText)
+                        if kind.showsPublication && !yearText.isEmpty &&
+                            publicationYear.map(PaperClassification.isValidPublicationYear) != true {
+                            throw LensError("请输入有效的四位发表年份。")
+                        }
+                        try catalog.edit(entry.id, category: category, keywords: terms, kind: kind,
+                                         venue: venue, publicationYear: publicationYear)
                         dismiss()
                     } catch { failure = error.localizedDescription }
                 }.keyboardShortcut(.defaultAction).buttonStyle(PrimaryButton())

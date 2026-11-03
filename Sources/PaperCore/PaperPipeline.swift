@@ -185,8 +185,10 @@ private final class ArxivRedirects: NSObject, URLSessionTaskDelegate, Sendable {
 enum ArxivDownload {
     private static let session = URLSession(configuration: .ephemeral, delegate: ArxivRedirects(), delegateQueue: nil)
 
-    static func metadata(_ requested: ArxivID) async -> (id: ArxivID, title: String?, details: PaperMetadata?) {
-        let request = URLRequest(url: requested.abstractURL, timeoutInterval: 15)
+    static func metadata(_ requested: ArxivID, reload: Bool = false) async -> (id: ArxivID, title: String?, details: PaperMetadata?) {
+        let request = URLRequest(url: requested.abstractURL,
+                                 cachePolicy: reload ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy,
+                                 timeoutInterval: 15)
         guard let (data, response) = try? await session.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let html = String(data: data, encoding: .utf8) else { return (requested, nil, nil) }
@@ -223,8 +225,10 @@ enum ArxivDownload {
         let date = fields["date"]?.first
         let publication = tableCell("jref") ?? fields["journal_title"]?.first ?? fields["conference_title"]?.first
         let comments = tableCell("comments")
-        let metadata = abstract != nil || !authors.isEmpty || date != nil || publication != nil || comments != nil
-            ? PaperMetadata(abstract: abstract, authors: authors, arxivDate: date, publication: publication, comments: comments)
+        let doi = fields["doi"]?.first
+        let metadata = abstract != nil || !authors.isEmpty || date != nil || publication != nil || comments != nil || doi != nil
+            ? PaperMetadata(abstract: abstract, authors: authors, arxivDate: date, publication: publication,
+                            comments: comments, doi: doi)
             : nil
         return (fields["title"]?.first, metadata)
     }

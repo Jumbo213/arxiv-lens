@@ -27,7 +27,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(user)
             if payload.get("task") == "classify":
                 rows = [{"id": row["id"], "category": "自然语言处理", "keywords": ["注意力", "注意力", "Transformer"],
-                         "kind": "conference"} for row in payload["documents"]]
+                         "kind": "conference", "venue": "NeurIPS", "publicationYear": 2017 if "Attention" in row["title"] else 2099,
+                         "evidence": "NeurIPS 2017"} for row in payload["documents"]]
                 rows.append({"id": "not-in-library", "category": "主题", "keywords": [], "kind": "journal"})
                 answer = {"classifications": rows}
             elif payload.get("task") == "search":

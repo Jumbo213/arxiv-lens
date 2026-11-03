@@ -11,6 +11,7 @@ struct PaperCoreTests {
             tests.testGlossary()
             tests.testHistoryGroups()
             tests.testCatalogMetadata()
+            try tests.testPublicationRefresh()
             try await tests.testCatalogAPI()
             try tests.testRewriteMultifilePaper()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
@@ -80,6 +81,7 @@ struct PaperCoreTests {
         <meta name="citation_title" content="A &amp; B" /><meta name="citation_author" content="Lin, A" />
         <meta name="citation_abstract" content="Research on semantic retrieval." />
         <meta name="citation_date" content="2025/03/09" />
+        <meta name="citation_doi" content="10.1103/PhysRevLett.116.061102" />
         <td class="tablecell jref">Journal of Testing <a href="#">12(3)</a></td>
         <td class="tablecell comments">Final version</td>
         """#)
@@ -88,11 +90,50 @@ struct PaperCoreTests {
         expectEqual(parsed.metadata?.abstract, "Research on semantic retrieval.")
         expectEqual(parsed.metadata?.publication, "Journal of Testing 12(3)")
         expectEqual(parsed.metadata?.comments, "Final version")
+        expectEqual(parsed.metadata?.doi, "10.1103/PhysRevLett.116.061102")
         expectEqual(LibraryCatalog.initial("《Transformer》"), "T")
         expectEqual(LibraryCatalog.initial("神经符号"), "S")
         expectEqual(LibraryCatalog.initial("Évaluation"), "E")
         expectEqual(LibraryCatalog.initial("2025 Report"), "#")
         expectEqual(try? ArxivID("hep-th/9901001").submissionMonth, "1999-01")
+    }
+
+    func testPublicationRefresh() throws {
+        let old = try JSONDecoder().decode(PaperClassification.self, from: Data(#"""
+        {"category":"我的分类","keywords":["我的关键词"],"kind":"preprint","manual":false}
+        """#.utf8))
+        expectNil(old.venue)
+        let accepted = PaperClassification(category: "不同主题", keywords: [], kind: .conference, manual: false,
+                                           venue: "NeurIPS", publicationYear: 2017)
+        let enriched = old.fillingPublication(from: accepted)
+        expectEqual(enriched.kind, .conference)
+        expectEqual(enriched.publicationLabel, "NeurIPS · 2017")
+        expectEqual(enriched.category, old.category)
+        expectEqual(enriched.keywords, old.keywords)
+        let journal = PaperClassification(category: "", keywords: [], kind: .journal, manual: false,
+                                          venue: "Physical Review Letters", publicationYear: 2016)
+        expectEqual(enriched.fillingPublication(from: journal), enriched)
+        let manual = PaperClassification(category: "", keywords: [], kind: .preprint, manual: true)
+        expectEqual(manual.fillingPublication(from: accepted), manual)
+        expectEqual(LibraryAI.acceptanceComment("16 pages; Accepted at ICML 2026"), "Accepted at ICML 2026")
+        expectNil(LibraryAI.acceptanceComment("Submitted to ICML 2026"))
+        expectNil(LibraryAI.acceptanceComment("Not accepted at ICML 2026"))
+        expectEqual(journal.publicationLabel, "Physical Review Letters · 2016")
+        expectEqual(LibraryAI.journalVenue(from: "Phys. Rev. Lett. 116, 061102 (2016)"), "Phys. Rev. Lett.")
+        expectEqual(LibraryAI.publicationYear(2099, in: "Phys. Rev. Lett. 116, 061102 (2016)"), 2016)
+        expectNil(LibraryAI.publicationYear(2099, in: "Phys. Rev. Lett. 116, 061102"))
+        expectNil(LibraryAI.publicationYear(nil, in: "Accepted 2025, published 2026"))
+        let doiJournal = PublishedReference.decode(Data(#"""
+        {"message":{"type":"journal-article","container-title":["Physical Review Letters"],"published":{"date-parts":[[2016,2,11]]}}}
+        """#.utf8))
+        expectEqual(doiJournal?.kind, .journal)
+        expectEqual(doiJournal?.venue, "Physical Review Letters")
+        expectEqual(doiJournal?.year, 2016)
+        let doiConference = PublishedReference.decode(Data(#"""
+        {"message":{"type":"proceedings-article","container-title":["Conference Proceedings"],"event":{"name":"Example Conference","start":{"date-parts":[[2025,11,1]]}},"published":{"date-parts":[[2026]]}}}
+        """#.utf8))
+        expectEqual(doiConference?.kind, .conference)
+        expectEqual(doiConference?.year, 2025)
     }
 
     func testCatalogAPI() async throws {
@@ -113,7 +154,9 @@ struct PaperCoreTests {
         let classified = try await LibraryAI.classify(entries, categories: ["自然语言处理"], settings: settings)
         expectEqual(Set(classified.keys), Set(entries.map(\.id)))
         expectEqual(classified[a.paperID]?.kind, .conference)
+        expectEqual(classified[a.paperID]?.publicationLabel, "NeurIPS · 2017")
         expectEqual(classified[b.paperID]?.kind, .preprint)
+        expectNil(classified[b.paperID]?.publicationLabel)
         expectEqual(classified[a.paperID]?.keywords, ["注意力", "Transformer"])
         let hits = try await LibraryAI.search("找出提出 Transformer 的论文", in: entries,
                                              classifications: classified, settings: settings) { _, _ in }
