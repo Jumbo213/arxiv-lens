@@ -23,7 +23,8 @@ private final class ReaderState: ObservableObject {
 
     let original: PDFDocument?
     let chinese: PDFDocument?
-    let alignment: PDFTextAlignment?
+    @Published private(set) var alignment: PDFTextAlignment?
+    @Published private(set) var rebuildingAlignment = false
     @Published var mode: ReadingMode = .compare
     @Published var sync = true
     @Published var originalPage = 0
@@ -67,6 +68,15 @@ private final class ReaderState: ObservableObject {
 
     func document(_ side: Side) -> PDFDocument? { side == .original ? original : chinese }
     func page(_ side: Side) -> Int { side == .original ? originalPage : chinesePage }
+
+    @MainActor
+    func rebuildAlignment(for paper: Paper) async {
+        guard paper.hasTranslation, alignment == nil, !rebuildingAlignment else { return }
+        rebuildingAlignment = true
+        defer { rebuildingAlignment = false }
+        let index = try? await PDFTextAlignment.recover(for: paper)
+        if !Task.isCancelled { alignment = index }
+    }
 
     func selected(_ selection: PDFSelection?, on side: Side) {
         guard mode == .compare, let alignment, let document = document(side) else { return }
@@ -160,6 +170,7 @@ struct ReaderView: View {
             reader.clearMatch()
             if mode == .compare && reader.sync { reader.align() }
         }
+        .task { await reader.rebuildAlignment(for: paper) }
         .alert("无法导出 PDF", isPresented: Binding(get: { exportError != nil },
                                                  set: { if !$0 { exportError = nil } })) {
             Button("好", role: .cancel) {}
@@ -199,10 +210,14 @@ struct ReaderView: View {
                             .toggleStyle(.checkbox)
                             .font(.system(size: 11))
                             .help("优先根据 PDF 书签匹配章节，缺少对应书签时按页数比例定位。")
-                        if reader.alignment != nil {
-                            Image(systemName: "highlighter").foregroundStyle(Palette.teal)
-                                .help("拖选任一侧的正文，另一侧会高亮对应句段")
-                                .accessibilityLabel("双语选区联动高亮")
+                        if reader.rebuildingAlignment {
+                            ProgressView().controlSize(.small).help("正在从本机 TeX 重建句子索引")
+                        } else {
+                            Image(systemName: "highlighter")
+                                .foregroundStyle(reader.alignment != nil ? Palette.teal : Palette.muted)
+                                .help(reader.alignment != nil ? "拖选正文，另一侧会高亮对应句子"
+                                      : "当前译本没有可用的句子索引")
+                                .accessibilityLabel(reader.alignment != nil ? "双语句子联动高亮" : "当前译本没有句子索引")
                         }
                     }
                 } else {

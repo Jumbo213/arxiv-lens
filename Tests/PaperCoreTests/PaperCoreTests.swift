@@ -305,29 +305,56 @@ struct PaperCoreTests {
         }
         let repeated = "An ambiguous sentence appears twice."
         let original = try document("en", pages: [
-            ["The model eval-", "uates visual reasoning.", repeated],
+            ["The model eval-", "uates visual reasoning.", "Results stay consistent across tasks.", repeated],
             [repeated]
         ])
         let chinese = try document("zh", pages: [
             ["导言"],
-            ["该模型评估视觉推理。", "这个句子有两个副本。"]
+            ["该模型评估视觉推理。不同任务的结果保持一致。", "这个句子有两个副本。"]
         ])
-        let index = try PDFTextAlignment.build([
-            ReadingPair(original: ["The model evaluates visual reasoning."], chinese: ["该模型评估视觉推理。"]),
+        let sentences = ReadingPair.sentences(
+            original: "The model evaluates visual reasoning. Results stay consistent across tasks.",
+            chinese: "该模型评估视觉推理。不同任务的结果保持一致。", originalTokens: [], chineseTokens: []
+        )
+        expectEqual(sentences.count, 2)
+        let merged = ReadingPair.sentences(
+            original: "The model evaluates visual reasoning. Results stay consistent across tasks.",
+            chinese: "该模型在多项视觉推理任务上得到了稳定结果。", originalTokens: [], chineseTokens: []
+        )
+        expectTrue(merged.isEmpty)
+        let questions = ReadingPair.sentences(
+            original: "A question (will it work? is it ready?) is answered. The score is recorded.",
+            chinese: "模型回答一个问题（它能运行吗？准备好了吗？）。系统记录得分。",
+            originalTokens: [], chineseTokens: []
+        )
+        expectEqual(questions.count, 2)
+        expectTrue(questions.first?.chinese.joined().contains("准备好了吗？") == true)
+        let index = try PDFTextAlignment.build(sentences + [
             ReadingPair(original: [repeated], chinese: ["这个句子有两个副本。"])
         ], original: original, chinese: chinese)
-        expectEqual(index.entries.count, 1)
+        expectEqual(index.entries.count, 2)
         let page = try unwrap(original.page(at: 0))
         let selected = try unwrap(page.selection(for: NSRange(location: 4, length: 5)))
         let forward = index.corresponding(to: PDFTextAlignment.spans(in: selected, document: original), fromOriginal: true)
+        expectEqual(forward.count, 1)
         expectEqual(forward.first?.page, 1)
         let translatedPage = try unwrap(chinese.page(at: 1))
         let target = try unwrap(forward.first)
         let highlighted = try unwrap(translatedPage.selection(for: target.range))
         expectTrue(highlighted.string?.contains("视觉推理") == true)
+        expectTrue(highlighted.string?.contains("保持一致") == false)
         let backward = index.corresponding(to: PDFTextAlignment.spans(in: highlighted, document: chinese), fromOriginal: false)
         expectEqual(backward.first?.page, 0)
-        print("VERIFIED two-way PDF selection alignment across different pages and line wraps")
+        let second = try unwrap(index.entries.last?.chinese.first)
+        let selectedSecond = try unwrap(translatedPage.selection(for: second.range))
+        let secondMatch = index.corresponding(to: PDFTextAlignment.spans(in: selectedSecond, document: chinese),
+                                              fromOriginal: false)
+        expectEqual(secondMatch.count, 1)
+        let secondSpan = try unwrap(secondMatch.first)
+        let secondOriginal = try unwrap(page.selection(for: secondSpan.range))
+        expectTrue(secondOriginal.string?.contains("Results stay consistent") == true)
+        expectTrue(secondOriginal.string?.contains("visual reasoning") == false)
+        print("VERIFIED neighboring sentences highlight independently in both directions across different pages")
     }
 
     func testCompileRetryUsesSavedTranslation() async throws {

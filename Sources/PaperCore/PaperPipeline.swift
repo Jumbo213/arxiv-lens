@@ -197,8 +197,8 @@ public enum PaperPipeline {
                         // Restored output depends on the actual tokens, so only
                         // cache excerpts that do not have placeholders.
                         if unit.tokens.isEmpty { cache[unit.prompt] = value }
-                        readingPairs.append(ReadingPair(original: TranslationUnit.readingFragments(unit.prompt),
-                                                        chinese: value.fragments))
+                        readingPairs += ReadingPair.sentences(original: unit.prompt, chinese: value.text,
+                                                              originalTokens: unit.tokens, chineseTokens: unit.tokens)
                     } else {
                         untranslated += 1
                     }
@@ -255,7 +255,7 @@ public enum PaperPipeline {
         try fm.createDirectory(at: staging, withIntermediateDirectories: false)
         try fm.moveItem(at: source, to: staging.appendingPathComponent("source", isDirectory: true))
         try JSONEncoder().encode(draft).write(to: staging.appendingPathComponent("draft.json"), options: .atomic)
-        try JSONEncoder().encode(readingPairs).write(to: staging.appendingPathComponent("reading-pairs.json"), options: .atomic)
+        try JSONEncoder().encode(readingPairs).write(to: staging.appendingPathComponent("sentence-pairs.json"), options: .atomic)
         try fm.createDirectory(at: parent, withIntermediateDirectories: true)
         try fm.moveItem(at: staging, to: destination)
         return destination
@@ -299,7 +299,7 @@ public enum PaperPipeline {
         }
         try fm.copyItem(at: compiled, to: result.appendingPathComponent("chinese.pdf"))
         if let originalPDF = PDFDocument(url: result.appendingPathComponent("original.pdf")),
-           let data = try? Data(contentsOf: folder.appendingPathComponent("reading-pairs.json")),
+           let data = try? Data(contentsOf: folder.appendingPathComponent("sentence-pairs.json")),
            let pairs = try? JSONDecoder().decode([ReadingPair].self, from: data) {
             await report(JobProgress("建立双语对照索引", draft.paper.title, 0.96))
             let index = try PDFTextAlignment.build(pairs, original: originalPDF, chinese: translatedPDF)

@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 import PDFKit
 
 public struct PDFTextSpan: Codable, Equatable, Sendable {
@@ -9,6 +10,100 @@ public struct PDFTextSpan: Codable, Equatable, Sendable {
 struct ReadingPair: Codable, Sendable {
     let original: [String]
     let chinese: [String]
+
+    private struct Sentence {
+        let fragments: [String]
+        let anchors: Set<String>
+    }
+
+    private static let markers = try! NSRegularExpression(pattern: #"ZXQ([0-9]{4})QXZ"#)
+    private static let technicalTerms = try! NSRegularExpression(pattern: #"\b[A-Z][A-Z0-9]{2,}\b"#)
+
+    static func sentences(original: String, chinese: String, originalTokens: [String], chineseTokens: [String]) -> [Self] {
+        let left = split(original, tokens: originalTokens, language: .english)
+        let right = split(chinese, tokens: chineseTokens, language: .simplifiedChinese)
+        guard !left.isEmpty, !right.isEmpty else { return [] }
+
+        // Unique shared notation can pin down a sentence even when a nearby
+        // translation merged or split sentences in a legacy paragraph.
+        func locations(_ sentences: [Sentence]) -> [String: [Int]] {
+            var locations: [String: [Int]] = [:]
+            for (index, sentence) in sentences.enumerated() {
+                for anchor in sentence.anchors { locations[anchor, default: []].append(index) }
+            }
+            return locations
+        }
+        let a = locations(left)
+        let b = locations(right)
+        var matches: [Int: Set<Int>] = [:]
+        for (anchor, indexes) in a where indexes.count == 1 {
+            if let other = b[anchor], other.count == 1 { matches[indexes[0], default: []].insert(other[0]) }
+        }
+        guard matches.values.allSatisfy({ $0.count == 1 }) else { return [] }
+        let anchors = matches.keys.sorted().compactMap { index in matches[index]?.first.map { (index, $0) } }
+        var leftStart = 0
+        var rightStart = 0
+        var result: [Self] = []
+        func append(_ i: Int, _ j: Int) {
+            result.append(Self(original: left[i].fragments, chinese: right[j].fragments))
+        }
+        for (i, j) in anchors + [(left.count, right.count)] {
+            guard i >= leftStart, j >= rightStart else { return [] }
+            if i - leftStart == j - rightStart {
+                for (from, to) in zip(leftStart..<i, rightStart..<j) { append(from, to) }
+            }
+            if i < left.count {
+                append(i, j)
+                leftStart = i + 1
+                rightStart = j + 1
+            }
+        }
+        return result
+    }
+
+    private static func split(_ source: String, tokens: [String], language: NLLanguage) -> [Sentence] {
+        let text = source.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        // Parenthetical questions can contain punctuation without ending the
+        // enclosing sentence. Mask those marks only for boundary detection.
+        var closers: [Character] = []
+        let masked = String(text.map { character -> Character in
+            switch character {
+            case "(": closers.append(")")
+            case "（": closers.append("）")
+            case "[": closers.append("]")
+            case "【": closers.append("】")
+            case ")", "）", "]", "】":
+                if closers.last == character { closers.removeLast() }
+            case ".", "!", "?", "。", "！", "？":
+                if !closers.isEmpty { return "," }
+            default: break
+            }
+            return character
+        })
+        let boundaries = closers.isEmpty ? masked : text
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.setLanguage(language)
+        tokenizer.string = boundaries
+        let original = text as NSString
+        return tokenizer.tokens(for: boundaries.startIndex..<boundaries.endIndex).compactMap { range in
+            let sentence = original.substring(with: NSRange(range, in: boundaries))
+            let fragments = TranslationUnit.readingFragments(sentence)
+            guard !fragments.isEmpty else { return nil }
+            let raw = sentence as NSString
+            let whole = NSRange(location: 0, length: raw.length)
+            let notation = markers.matches(in: sentence, range: whole).compactMap { match -> String? in
+                guard let index = Int(raw.substring(with: match.range(at: 1))), tokens.indices.contains(index) else { return nil }
+                let token = tokens[index].filter { !$0.isWhitespace }
+                guard token.contains("\\cite") || token.contains("\\ref") || token.contains("\\eqref")
+                        || (token.hasPrefix("$") && token.count >= 8) else { return nil }
+                return token
+            }
+            let prose = fragments.joined(separator: " ")
+            let terms = technicalTerms.matches(in: prose, range: NSRange(location: 0, length: prose.utf16.count))
+                .map { (prose as NSString).substring(with: $0.range) }
+            return Sentence(fragments: fragments, anchors: Set(notation + terms))
+        }
+    }
 }
 
 public struct PDFTextAlignment: Codable, Sendable {
@@ -18,9 +113,44 @@ public struct PDFTextAlignment: Codable, Sendable {
     }
 
     let entries: [Entry]
+    let version: Int
+    private static let currentVersion = 2
 
     public static func load(for paper: Paper) -> Self? {
-        try? JSONDecoder().decode(Self.self, from: Data(contentsOf: paper.directory.appendingPathComponent("alignment.json")))
+        load(for: paper, in: Paper.support)
+    }
+
+    private static func load(for paper: Paper, in support: URL) -> Self? {
+        guard let data = try? Data(contentsOf: paper.directory(in: support).appendingPathComponent("alignment.json")),
+              let index = try? JSONDecoder().decode(Self.self, from: data),
+              index.version == currentVersion, !index.entries.isEmpty else { return nil }
+        return index
+    }
+
+    public static func recover(for paper: Paper) async throws -> Self? {
+        try recover(for: paper, in: Paper.support)
+    }
+
+    static func recover(for paper: Paper, in support: URL) throws -> Self? {
+        if let existing = load(for: paper, in: support) { return existing }
+        let fm = FileManager.default
+        guard paper.hasTranslation, let id = try? ArxivID(paper.arxivID) else { return nil }
+        let directory = paper.directory(in: support)
+        let translated = directory.appendingPathComponent("source", isDirectory: true)
+        let candidates = id.isVersioned ? [paper] + Paper.history(in: support).filter { $0.arxivID == paper.arxivID } : [paper]
+        guard fm.fileExists(atPath: translated.path),
+              let originalSource = candidates.lazy.map({ $0.originalSource(in: support) })
+                .first(where: { fm.fileExists(atPath: $0.path) }),
+              let originalPDF = PDFDocument(url: directory.appendingPathComponent("original.pdf")),
+              let chinesePDF = PDFDocument(url: directory.appendingPathComponent("chinese.pdf")) else { return nil }
+        let project = try TeXProject.read(from: originalSource)
+        let pairs = try project.recoverReadingPairs(originalSource: originalSource, translatedSource: translated)
+        let alignment = try build(pairs, original: originalPDF, chinese: chinesePDF)
+        guard !alignment.entries.isEmpty else { return nil }
+        try Task.checkCancellation()
+        if let existing = load(for: paper, in: support) { return existing }
+        try? JSONEncoder().encode(alignment).write(to: directory.appendingPathComponent("alignment.json"), options: .atomic)
+        return alignment
     }
 
     public func corresponding(to selection: [PDFTextSpan], fromOriginal: Bool) -> [PDFTextSpan] {
@@ -59,7 +189,7 @@ public struct PDFTextAlignment: Codable, Sendable {
             let b = right.locate(pair.chinese)
             if !b.isEmpty { entries.append(Entry(original: a, chinese: b)) }
         }
-        return Self(entries: entries)
+        return Self(entries: entries, version: currentVersion)
     }
 }
 

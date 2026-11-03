@@ -235,7 +235,7 @@ struct TranslationAPI: Sendable {
 
     struct Excerpt: Sendable {
         let tex: String
-        let fragments: [String]
+        let text: String
     }
 
     func translate(_ units: ArraySlice<TranslationUnit>, title: String, context: String,
@@ -272,7 +272,7 @@ struct TranslationAPI: Sendable {
         else { return Array(repeating: nil, count: units.count) }
         return zip(units, ids).map { unit, id in
             guard let text = translations[id], let tex = unit.restore(text) else { return nil }
-            return Excerpt(tex: tex, fragments: TranslationUnit.readingFragments(text))
+            return Excerpt(tex: tex, text: text)
         }
     }
 

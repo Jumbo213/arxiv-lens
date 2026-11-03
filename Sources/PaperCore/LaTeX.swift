@@ -152,6 +152,74 @@ struct TeXProject {
     let title: String?
     let drafts: [TeXDraft]
 
+    func recoverReadingPairs(originalSource: URL, translatedSource: URL) throws -> [ReadingPair] {
+        let base = originalSource.resolvingSymlinksInPath().path + "/"
+        var pairs: [ReadingPair] = []
+        for draft in drafts {
+            try Task.checkCancellation()
+            guard draft.url.path.hasPrefix(base) else { continue }
+            let relativePath = String(draft.url.path.dropFirst(base.count))
+            let translated = translatedSource.appendingPathComponent(relativePath)
+            guard let content = try? Self.readFile(translated) else { continue }
+            pairs += Self.recoverReadingPairs(original: draft.content, translated: content)
+        }
+        return pairs
+    }
+
+    static func recoverReadingPairs(original: String, translated: String) -> [ReadingPair] {
+        func body(_ source: String) -> String {
+            let clean = uncomment(source)
+            guard let start = documentStart.matches(clean).first else { return clean }
+            return (clean as NSString).substring(from: NSMaxRange(start.range))
+        }
+
+        func blocks(_ source: String) -> [String] {
+            body(source).replacingOccurrences(of: #"\r?\n[ \t]*\r?\n"#, with: "\u{001F}", options: .regularExpression)
+                .components(separatedBy: "\u{001F}")
+        }
+
+        func units(_ source: String) -> (units: [TranslationUnit], gaps: [String]) {
+            var scanner = Scanner(source, recovering: true)
+            let text = source as NSString
+            scanner.scan(from: 0, to: text.length)
+            var gaps: [String] = []
+            var start = 0
+            for unit in scanner.units {
+                gaps.append(compact(text.substring(with: NSRange(location: start, length: unit.range.location - start))))
+                start = NSMaxRange(unit.range)
+            }
+            gaps.append(compact(text.substring(from: start)))
+            return (scanner.units, gaps)
+        }
+
+        func compact(_ text: String) -> String { text.filter { !$0.isWhitespace } }
+
+        func compatible(_ a: TranslationUnit, _ b: TranslationUnit) -> Bool {
+            // Translators could move numeric placeholders. Compare the other
+            // protected TeX in order to confirm both excerpts share a structure.
+            func structure(_ unit: TranslationUnit) -> String {
+                let numbers = unit.numericTokens
+                return compact(unit.tokens.indices.filter { numbers[$0] == nil }.map { unit.tokens[$0] }.joined())
+            }
+            return structure(a) == structure(b)
+        }
+
+        let left = blocks(original)
+        let right = blocks(translated)
+        guard left.count == right.count else { return [] }
+        var pairs: [ReadingPair] = []
+        for (a, b) in zip(left, right) {
+            let aa = units(a)
+            let bb = units(b)
+            guard aa.gaps == bb.gaps else { continue }
+            for (original, translated) in zip(aa.units, bb.units) where compatible(original, translated) {
+                pairs += ReadingPair.sentences(original: original.prompt, chinese: translated.prompt,
+                                              originalTokens: original.tokens, chineseTokens: translated.tokens)
+            }
+        }
+        return pairs
+    }
+
     static func read(from directory: URL) throws -> Self {
         let directory = directory.resolvingSymlinksInPath()
         let fm = FileManager.default
@@ -250,8 +318,10 @@ private struct Scanner {
     private(set) var units: [TranslationUnit] = []
     private var parts: [(NSRange, Bool)] = []
     private var limit: Int
+    private let recovering: Bool
 
     private static let word = try! NSRegularExpression(pattern: #"[a-z]{2,}"#, options: .caseInsensitive)
+    private static let recoverableWord = try! NSRegularExpression(pattern: #"[a-z]{2,}|\p{Script=Han}"#, options: .caseInsensitive)
     private static let command = try! NSRegularExpression(pattern: #"\\(?:[a-zA-Z@]+\*?|[^\r\n])"#)
     private static let identifier = try! NSRegularExpression(pattern: #"https?://[^\s{}\\]+|(?<![\w.])[+-]?\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?(?![\w]|\.\d)"#)
     private static let sentenceBreak = try! NSRegularExpression(
@@ -282,7 +352,12 @@ private struct Scanner {
         "newcommand", "renewcommand", "providecommand", "def", "maketitle", "appendix"
     ]
 
-    init(_ source: String) { self.source = source; text = source as NSString; limit = text.length }
+    init(_ source: String, recovering: Bool = false) {
+        self.source = source
+        self.recovering = recovering
+        text = source as NSString
+        limit = text.length
+    }
 
     func group(at start: Int) -> NSRange? {
         guard start < limit else { return nil }
@@ -424,7 +499,7 @@ private struct Scanner {
         let required = args.filter { text.character(at: $0.location) == 123 }
         if name == "begin", let environment = required.first {
             let env = slice(environment.location + 1, NSMaxRange(environment) - 1)
-            if env == "abstract" {
+            if env == "abstract" && !recovering {
                 let tail = text.range(of: "\\end{abstract}", options: [],
                                       range: NSRange(location: last, length: to - last))
                 if tail.location != NSNotFound {
@@ -482,7 +557,8 @@ private struct Scanner {
 
     private mutating func flush() {
         defer { parts.removeAll(keepingCapacity: true) }
-        guard let first = parts.firstIndex(where: { !$0.1 && Self.word.matches(text.substring(with: $0.0)).first != nil }),
+        let word = recovering ? Self.recoverableWord : Self.word
+        guard let first = parts.firstIndex(where: { !$0.1 && word.matches(text.substring(with: $0.0)).first != nil }),
               let last = parts.lastIndex(where: { !$0.1 && !text.substring(with: $0.0).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
               last >= first else { return }
         var relevant = Array(parts[first...last])
