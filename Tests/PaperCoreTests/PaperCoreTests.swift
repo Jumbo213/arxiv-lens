@@ -239,11 +239,31 @@ struct PaperCoreTests {
             return
         }
         let settings = try TranslationSettings(url: mock, model: "mock", key: "")
+        try await testLegacyCJKWithXeLaTeX()
         let support = try temp()
         defer { try? FileManager.default.removeItem(at: support) }
         let ids = environment["ARXIV_LENS_TEST_PAPERS"]?.split(separator: ",").map(String.init) ?? ["1706.03762"]
         for id in ids {
-            let download = try await PaperPipeline.run(input: id, settings: nil, support: support) { progress in
+            let rejecting = try TranslationSettings(url: mock, model: "fixture-reject-translation", key: "")
+            do {
+                _ = try await PaperPipeline.run(input: id, settings: rejecting, support: support, originalReady: { original in
+                    expectTrue(!original.hasTranslation)
+                    expectTrue(Paper.history(in: support).contains(original))
+                }) { _ in }
+                preconditionFailure("Expected the mock translation API to fail")
+            } catch {
+                expectTrue(error.localizedDescription.contains("HTTP 401"))
+            }
+            let requested = try ArxivID(id)
+            let retained = Paper.history(in: support).filter { $0.paperID == requested.paperID }
+            expectEqual(retained.count, 1)
+            let savedOriginal = try unwrap(retained.first)
+            expectTrue(!savedOriginal.hasTranslation)
+            let savedPDF = try unwrap(PDFDocument(url: savedOriginal.directory(in: support).appendingPathComponent("original.pdf")))
+            expectGreaterThan(savedPDF.pageCount, 0)
+            print("VERIFIED original PDF retained after failed translation \(savedOriginal.arxivID)")
+
+            let download = try await PaperPipeline.run(input: savedOriginal.arxivID, settings: nil, support: support) { progress in
                 print("\(progress.title) \(progress.detail)")
             }
             let downloadedFolder = download.directory(in: support)
@@ -254,8 +274,7 @@ struct PaperCoreTests {
             expectTrue(!FileManager.default.fileExists(atPath: downloadedFolder.appendingPathComponent("chinese.pdf").path))
             expectTrue(Paper.history(in: support).contains(download))
             if try ArxivID(download.arxivID).isVersioned {
-                let cached = try await PaperPipeline.run(input: download.arxivID, settings: nil, support: support) { _ in }
-                expectEqual(cached, download)
+                expectEqual(download, savedOriginal)
             }
             print("VERIFIED download-only record \(download.arxivID)")
 
@@ -292,6 +311,34 @@ struct PaperCoreTests {
                 try FileManager.default.copyItem(at: folder, to: destination.appendingPathComponent(paper.id.uuidString))
             }
         }
+    }
+
+    private func testLegacyCJKWithXeLaTeX() async throws {
+        let folder = try temp()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let root = folder.appendingPathComponent("main.tex")
+        try #"""
+        \documentclass{article}
+        \input{preamble}
+        \begin{document}
+        The original legacy text is \begin{CJK*}{UTF8}{gbsn}中文词汇\end{CJK*}.
+        \begin{CJK}[UTF8]{UTF8}{gbsn}传统环境\end{CJK}
+        \end{document}
+        """#.write(to: root, atomically: true, encoding: .utf8)
+        try #"\usepackage{CJKutf8,booktabs}"#.write(to: folder.appendingPathComponent("preamble.tex"),
+                                                    atomically: true, encoding: .utf8)
+        let project = try TeXProject.read(from: folder)
+        let draft = try unwrap(project.drafts.first)
+        let translated = draft.units.map { $0.restore("译文 " + $0.prompt) }
+        try draft.write(translated, font: "Songti SC")
+        let bin = URL(fileURLWithPath: try await LocalTeX.check(""), isDirectory: true)
+        let log = folder.appendingPathComponent("compile.log")
+        let output = try await LocalTeX.compile(root: root, workspace: folder, bin: bin, log: log)
+        let pdf = try unwrap(PDFDocument(url: output))
+        expectTrue(pdf.string?.contains("中文词汇") == true)
+        expectTrue(pdf.string?.contains("传统环境") == true)
+        expectTrue(try String(contentsOf: root, encoding: .utf8).contains(#"\disable@package@load{CJKutf8}"#))
+        print("VERIFIED XeLaTeX retries with legacy CJK compatibility and retains Chinese text")
     }
 
     private func temp() throws -> URL {

@@ -4,9 +4,11 @@ import PDFKit
 
 public enum PaperPipeline {
     public static func run(
-        input: String, settings: TranslationSettings, report: @Sendable (JobProgress) async -> Void
+        input: String, settings: TranslationSettings, originalReady: @Sendable (Paper) async -> Void = { _ in },
+        report: @Sendable (JobProgress) async -> Void
     ) async throws -> Paper {
-        try await run(input: input, settings: settings, support: Paper.support, report: report)
+        try await run(input: input, settings: settings, support: Paper.support,
+                      originalReady: originalReady, report: report)
     }
 
     public static func download(
@@ -16,7 +18,9 @@ public enum PaperPipeline {
     }
 
     static func run(
-        input: String, settings: TranslationSettings?, support: URL, report: @Sendable (JobProgress) async -> Void
+        input: String, settings: TranslationSettings?, support: URL,
+        originalReady: @Sendable (Paper) async -> Void = { _ in },
+        report: @Sendable (JobProgress) async -> Void
     ) async throws -> Paper {
         let requested = try ArxivID(input)
         let fm = FileManager.default
@@ -55,13 +59,26 @@ public enum PaperPipeline {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackTitle = pdfTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "arXiv \(arxiv.value)"
 
-        guard let settings else {
-            let paper = Paper(id: id, arxivID: arxiv.value, title: metadata.title ?? fallbackTitle,
-                              completedAt: .now, untranslated: 0, downloadOnly: true, metadata: metadata.details)
-            try publish(paper, from: result, in: support)
-            await report(JobProgress("原文已加入文献库", paper.title, 1))
-            return paper
+        let originalPaper: Paper
+        if let cached {
+            originalPaper = cached
+        } else {
+            // Commit the validated download independently of the translation job.
+            let originalResult = settings == nil ? result : workspace.appendingPathComponent("download")
+            if settings != nil {
+                try fm.createDirectory(at: originalResult, withIntermediateDirectories: false)
+                try fm.copyItem(at: original, to: originalResult.appendingPathComponent("original.pdf"))
+            }
+            originalPaper = Paper(id: UUID(), arxivID: arxiv.value, title: metadata.title ?? fallbackTitle,
+                                  completedAt: .now, untranslated: 0, downloadOnly: true, metadata: metadata.details)
+            try publish(originalPaper, from: originalResult, in: support)
         }
+        guard let settings else {
+            await report(JobProgress("原文已加入文献库", originalPaper.title, 1))
+            return originalPaper
+        }
+        await originalReady(originalPaper)
+        try Task.checkCancellation()
 
         await report(JobProgress("检查本机 TeX", "确认 XeLaTeX、latexmk 和中文排版组件", 0.18))
         let bin = URL(fileURLWithPath: try await LocalTeX.check(settings.texPath), isDirectory: true)
@@ -160,6 +177,7 @@ public enum PaperPipeline {
         try fm.copyItem(at: compiled, to: result.appendingPathComponent("chinese.pdf"))
         let paper = Paper(id: id, arxivID: arxiv.value, title: title, completedAt: .now,
                           untranslated: untranslated, metadata: metadata.details ?? cached?.metadata)
+        try Task.checkCancellation()
         try publish(paper, from: result, in: support)
         await report(JobProgress("已加入文献库", title, 1))
         return paper
@@ -168,7 +186,6 @@ public enum PaperPipeline {
     private static func publish(_ paper: Paper, from result: URL, in support: URL) throws {
         try JSONEncoder().encode(paper).write(to: result.appendingPathComponent("paper.json"), options: .atomic)
         try FileManager.default.createDirectory(at: Paper.library(in: support), withIntermediateDirectories: true)
-        try Task.checkCancellation()
         try FileManager.default.moveItem(at: result, to: paper.directory(in: support))
     }
 }

@@ -20,6 +20,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if request["model"] == "fixture-reject-translation":
+            self.send_error(401)
+            return
         user = request["messages"][-1]["content"]
         if user == "Say OK.":
             content = "OK"

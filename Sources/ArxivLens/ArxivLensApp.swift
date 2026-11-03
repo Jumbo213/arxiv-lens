@@ -87,6 +87,7 @@ final class LibraryStore: ObservableObject {
     @Published var failure: String?
     @Published var cancelling = false
     private var task: Task<Void, Never>?
+    private var jobHasOriginal = false
 
     init() { selected = papers.first }
 
@@ -112,14 +113,21 @@ final class LibraryStore: ObservableObject {
         job = JobProgress(title: downloadOnly ? "准备下载" : "准备翻译", detail: "正在启动任务", fraction: 0)
         task = Task { [weak self] in
             guard let self else { return }
-            defer { self.task = nil; self.job = nil; self.cancelling = false }
+            defer {
+                self.task = nil
+                self.job = nil
+                self.cancelling = false
+                self.jobHasOriginal = false
+            }
             do {
                 let report: @Sendable (JobProgress) async -> Void = { [weak self] status in
                     await self?.update(status)
                 }
                 let result: Paper
                 if let settings {
-                    result = try await PaperPipeline.run(input: link, settings: settings, report: report)
+                    result = try await PaperPipeline.run(input: link, settings: settings, originalReady: { [weak self] original in
+                        await self?.showSavedOriginal(original)
+                    }, report: report)
                 } else {
                     result = try await PaperPipeline.download(input: link, report: report)
                 }
@@ -128,9 +136,19 @@ final class LibraryStore: ObservableObject {
                 if paper == nil, input == link { input = "" }
                 autoClassify(result, settings: settings)
             } catch {
-                if !Task.isCancelled { failure = error.localizedDescription }
+                if !Task.isCancelled {
+                    let saved = jobHasOriginal ? "原版 PDF 已保存在左侧文献库，可打开原文或再次翻译。\n\n" : ""
+                    failure = saved + error.localizedDescription
+                }
             }
         }
+    }
+
+    private func showSavedOriginal(_ paper: Paper) {
+        jobHasOriginal = true
+        guard !papers.contains(where: { $0.id == paper.id }) else { return }
+        papers = Paper.history()
+        select(paper, original: true)
     }
 
     func apiSettings(interactive: Bool = true) -> TranslationSettings? {

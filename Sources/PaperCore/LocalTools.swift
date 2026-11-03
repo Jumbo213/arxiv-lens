@@ -148,15 +148,40 @@ public enum LocalTeX {
     static func compile(root: URL, workspace: URL, bin: URL, log: URL) async throws -> URL {
         let relative = root.lastPathComponent
         let build = workspace.appendingPathComponent("build", isDirectory: true)
-        try FileManager.default.createDirectory(at: build, withIntermediateDirectories: true)
-        let result = try await LocalTool.run(
-            bin.appendingPathComponent("latexmk").path,
-            ["-norc", "-xelatex", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
-             "-no-shell-escape", "-outdir=\(build.path)", "./\(relative)"],
-            in: root.deletingLastPathComponent(), log: log, writable: workspace, tex: bin, timeout: 600
-        )
+        let fm = FileManager.default
+        func compileOnce() async throws -> ToolResult {
+            try fm.createDirectory(at: build, withIntermediateDirectories: true)
+            return try await LocalTool.run(
+                bin.appendingPathComponent("latexmk").path,
+                ["-norc", "-xelatex", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
+                 "-no-shell-escape", "-outdir=\(build.path)", "./\(relative)"],
+                in: root.deletingLastPathComponent(), log: log, writable: workspace, tex: bin, timeout: 600
+            )
+        }
+        var result = try await compileOnce()
+        if result.status != 0, result.tail().range(
+            of: #"Package ctexhook Error: Package .CJK(?:utf8)?' can not be loaded with .xeCJK'"#,
+            options: .regularExpression
+        ) != nil {
+            try Task.checkCancellation()
+            // Disable the legacy loader before the class or any included style can
+            // load it. XeLaTeX and xeCJK already handle Unicode and Chinese fonts.
+            let compatibility = #"""
+            % Arxiv Lens: use xeCJK for legacy UTF-8 CJK environments.
+            \makeatletter
+            \disable@package@load{CJK}{}
+            \disable@package@load{CJKutf8}{}
+            \makeatother
+            \ProvideDocumentEnvironment{CJK}{O{}mm}{\ignorespaces}{\ignorespacesafterend}
+            \ProvideDocumentEnvironment{CJK*}{O{}mm}{\ignorespaces}{\ignorespacesafterend}
+            """#
+            let source = try String(contentsOf: root, encoding: .utf8)
+            try (compatibility + "\n" + source).write(to: root, atomically: true, encoding: .utf8)
+            try fm.removeItem(at: build)
+            result = try await compileOnce()
+        }
         let pdf = build.appendingPathComponent(root.deletingPathExtension().lastPathComponent + ".pdf")
-        guard result.status == 0, FileManager.default.fileExists(atPath: pdf.path) else {
+        guard result.status == 0, fm.fileExists(atPath: pdf.path) else {
             throw LensError("XeLaTeX 编译失败。\n\(result.tail())")
         }
         return pdf
