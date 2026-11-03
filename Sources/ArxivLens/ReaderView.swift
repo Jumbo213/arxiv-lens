@@ -81,12 +81,14 @@ private final class ReaderState: ObservableObject {
 
 struct ReaderView: View {
     let paper: Paper
+    @Binding var compact: Bool
     @StateObject private var reader: ReaderState
     @ViewState private var zoom: CGFloat = 1
     @ViewState private var exportError: String?
 
-    init(paper: Paper) {
+    init(paper: Paper, compact: Binding<Bool>) {
         self.paper = paper
+        _compact = compact
         _reader = StateObject(wrappedValue: ReaderState(paper))
     }
 
@@ -115,46 +117,41 @@ struct ReaderView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Text("ARXIV \(paper.arxivID)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .tracking(1.2).foregroundStyle(Palette.teal)
-                Circle().fill(Palette.line).frame(width: 4, height: 4)
-                Text(paper.completedAt, format: .dateTime.year().month().day())
-                    .font(.system(size: 11)).foregroundStyle(Palette.muted)
-                Spacer()
-                Menu {
-                    Button("导出英文 PDF…") { export(.original) }
-                    Button("导出中文 PDF…") { export(.chinese) }
-                    Divider()
-                    Button("在访达中显示译后 TeX") {
-                        NSWorkspace.shared.open(paper.sourceURL)
-                    }
-                    if let id = try? ArxivID(paper.arxivID) {
-                        Button("在 arXiv 打开") { NSWorkspace.shared.open(id.abstractURL) }
-                    }
-                } label: {
-                    Label("文件", systemImage: "square.and.arrow.up")
-                }.fixedSize()
+            if !compact {
+                HStack(spacing: 7) {
+                    Text("ARXIV \(paper.arxivID)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .tracking(1.2).foregroundStyle(Palette.teal)
+                    Circle().fill(Palette.line).frame(width: 4, height: 4)
+                    Text(paper.completedAt, format: .dateTime.year().month().day())
+                        .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                }
+                Text(paper.title)
+                    .font(.system(size: 24, weight: .semibold, design: .serif))
+                    .lineLimit(2)
+                    .help(paper.title)
             }
-            Text(paper.title)
-                .font(.system(size: 24, weight: .semibold, design: .serif))
-                .lineLimit(2)
-                .help(paper.title)
-            HStack(spacing: 12) {
+            HStack(spacing: 9) {
                 Picker("阅读模式", selection: $reader.mode) {
-                    ForEach(ReadingMode.allCases, id: \.self) { Text($0.rawValue) }
+                    Text("对照").tag(ReadingMode.compare)
+                    Text("原文").tag(ReadingMode.original)
+                    Text("译文").tag(ReadingMode.chinese)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 275)
+                .frame(width: 176)
                 if reader.mode == .compare {
                     Toggle("联动翻页", isOn: $reader.sync)
                         .toggleStyle(.checkbox)
                         .font(.system(size: 11))
                         .help("优先根据 PDF 书签匹配章节，缺少对应书签时按页数比例定位。")
                 }
-                Spacer()
+                Spacer(minLength: 4)
+                if paper.untranslated > 0 {
+                    Label("\(paper.untranslated) 段原文", systemImage: "info.circle")
+                        .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                        .help("这些片段的译文未通过结构校验，PDF 保留对应原文。")
+                }
                 Button { zoom = max(0.75, zoom - 0.25) } label: {
                     Image(systemName: "minus.magnifyingglass")
                 }
@@ -164,16 +161,35 @@ struct ReaderView: View {
                     Image(systemName: "plus.magnifyingglass")
                 }
                 .help("放大").accessibilityLabel("放大")
-            }
-            .padding(.top, 3)
-            if paper.untranslated > 0 {
-                Label("\(paper.untranslated) 段保留原文。模型的译文未通过结构校验。", systemImage: "info.circle")
-                    .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                fileMenu
+                Button {
+                    compact.toggle()
+                } label: {
+                    Label(compact ? "展开顶部" : "收起顶部", systemImage: compact ? "chevron.down" : "chevron.up")
+                }
+                .help(compact ? "显示论文标题和 arXiv 地址栏" : "隐藏论文标题和 arXiv 地址栏")
+                .fixedSize()
             }
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 13)
+        .padding(.horizontal, compact ? 13 : 22)
+        .padding(.vertical, compact ? 9 : 13)
         .background(Palette.paper)
+    }
+
+    private var fileMenu: some View {
+        Menu {
+            Button("导出英文 PDF…") { export(.original) }
+            Button("导出中文 PDF…") { export(.chinese) }
+            Divider()
+            Button("在访达中显示译后 TeX") {
+                NSWorkspace.shared.open(paper.sourceURL)
+            }
+            if let id = try? ArxivID(paper.arxivID) {
+                Button("在 arXiv 打开") { NSWorkspace.shared.open(id.abstractURL) }
+            }
+        } label: {
+            Label("文件", systemImage: "square.and.arrow.up")
+        }.fixedSize()
     }
 
     private func pane(_ side: Side) -> some View {

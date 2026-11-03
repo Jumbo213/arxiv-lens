@@ -8,12 +8,15 @@ struct SettingsView: View {
     @AppStorage("model") private var savedModel = ""
     @AppStorage("glossary") private var savedGlossary = ""
     @AppStorage("texPath") private var savedTex = ""
+    @AppStorage("lineSpacing") private var savedSpacing = LineSpacing.comfortable.rawValue
     @ViewState private var endpoint = ""
     @ViewState private var model = ""
     @ViewState private var glossary = ""
     @ViewState private var tex = ""
+    @ViewState private var spacing: LineSpacing = .comfortable
     @ViewState private var key = ""
     @ViewState private var status = ""
+    @ViewState private var glossaryOpen = false
     @ViewState private var isError = false
     @ViewState private var checking = false
     @ViewState private var checkTask: Task<Void, Never>?
@@ -51,6 +54,20 @@ struct SettingsView: View {
                     Button("检测 TeX") { check { "已找到 " + (try await LocalTeX.check(tex)) } }.disabled(checking)
                 }
             }
+            field("译文行距") {
+                VStack(alignment: .leading, spacing: 5) {
+                    Picker("译文行距", selection: $spacing) {
+                        Text("贴近原稿").tag(LineSpacing.original)
+                        Text("舒展").tag(LineSpacing.comfortable)
+                        Text("宽松").tag(LineSpacing.spacious)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 240)
+                    Text("适用于新生成的中文 PDF，行距变化可能影响分页。")
+                        .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                }
+            }
             field("术语表") {
                 VStack(alignment: .leading, spacing: 5) {
                     TextEditor(text: $glossary).font(.system(size: 12))
@@ -58,8 +75,12 @@ struct SettingsView: View {
                         .padding(4)
                         .background(.white, in: RoundedRectangle(cornerRadius: 6))
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Palette.line))
-                    Text("可选，每行一条，例如 attention mechanism = 注意力机制")
-                        .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                    HStack {
+                        Text("每行一条，例 attention mechanism = 注意力机制。自定义译名优先。")
+                            .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                        Spacer()
+                        Button("查看内置术语…") { glossaryOpen = true }
+                    }
                 }
             }
             if !status.isEmpty {
@@ -84,9 +105,11 @@ struct SettingsView: View {
             model = savedModel
             glossary = savedGlossary
             tex = savedTex
+            spacing = LineSpacing(rawValue: savedSpacing) ?? .comfortable
             key = Keychain.read()
         }
         .onDisappear { checkTask?.cancel() }
+        .sheet(isPresented: $glossaryOpen) { GlossaryView() }
     }
 
     private func field<Content: View>(_ name: String, @ViewBuilder content: () -> Content) -> some View {
@@ -99,7 +122,7 @@ struct SettingsView: View {
     }
 
     private func settings() throws -> TranslationSettings {
-        try TranslationSettings(url: endpoint, model: model, key: key, glossary: glossary, texPath: tex)
+        try TranslationSettings(url: endpoint, model: model, key: key, glossary: glossary, texPath: tex, lineSpacing: spacing)
     }
 
     private func save() {
@@ -110,6 +133,7 @@ struct SettingsView: View {
             savedModel = model
             savedGlossary = glossary
             savedTex = tex
+            savedSpacing = spacing.rawValue
             dismiss()
         } catch {
             isError = true
@@ -139,5 +163,51 @@ struct SettingsView: View {
         panel.showsHiddenFiles = true
         panel.prompt = "选择 TeX bin"
         if panel.runModal() == .OK, let url = panel.url { tex = url.path }
+    }
+}
+
+
+private struct GlossaryView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ViewState private var category = 0
+    @ViewState private var query = ""
+    private let sections = GlossaryCatalog.sections
+
+    private var results: [GlossaryCatalog.Term] {
+        let filter = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let terms = sections[category].terms
+        guard !filter.isEmpty else { return terms }
+        return terms.filter { $0.english.localizedCaseInsensitiveContains(filter) || $0.chinese.contains(filter) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("内置术语").font(.system(size: 24, weight: .semibold, design: .serif))
+            Text("翻译时按段落匹配词条。需要其他译法时，可以在设置中添加同名自定义词条。")
+                .font(.system(size: 12)).foregroundStyle(Palette.muted)
+            Picker("领域", selection: $category) {
+                ForEach(sections.indices, id: \.self) { index in
+                    Text(sections[index].title).tag(index)
+                }
+            }.pickerStyle(.segmented).labelsHidden()
+            TextField("搜索当前领域的英中术语", text: $query).textFieldStyle(.roundedBorder)
+            List(results) { term in
+                HStack(alignment: .firstTextBaseline) {
+                    Text(term.english).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(term.chinese).foregroundStyle(Palette.teal)
+                }
+                .textSelection(.enabled)
+                .font(.system(size: 12))
+            }
+            .frame(height: 292)
+            HStack {
+                Text("\(results.count) 条").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 660)
+        .background(Palette.paper)
     }
 }

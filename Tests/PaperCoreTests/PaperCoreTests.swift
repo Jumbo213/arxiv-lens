@@ -8,6 +8,7 @@ struct PaperCoreTests {
         do {
             try tests.testArxivLinkAndEndpointNormalization()
             try tests.testProtectedTokensRejectReorderAndEscapeProse()
+            tests.testGlossary()
             try tests.testRewriteMultifilePaper()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
             print("All smoke tests passed.")
@@ -35,7 +36,19 @@ struct PaperCoreTests {
         expectNil(unit.restore("参见 ZXQ0001QXZ 与 ZXQ0000QXZ。"))
         expectNil(unit.restore("参见 ZXQ0000QXZ。"))
         expectNil(unit.restore("See ZXQ0000QXZ and ZXQ0001QXZ."))
+        let numeric = TranslationUnit(range: NSRange(location: 0, length: 2),
+                                      prompt: "ZXQ0000QXZ points on ZXQ0001QXZ.", tokens: ["28.4", "2014"])
+        expectEqual(numeric.restore("在 ZXQ0001QXZ 年获得 ZXQ0000QXZ 分。"), "在 2014 年获得 28.4 分。")
         expectEqual(unit.restore("参见 ZXQ0000QXZ 与 ZXQ0001QXZ，%和&。"), #"参见 $x_i$ 与 \cite{x}，\%和\&。"#)
+    }
+
+    func testGlossary() {
+        let matched = GlossaryCatalog.relevant(to: "LLMs use DPO and self-attention for symbolic reasoning.",
+                                               custom: "self-attention = 自定义译名")
+        expectTrue(matched.contains("LLM = 大语言模型"))
+        expectTrue(matched.contains("DPO = 直接偏好优化"))
+        expectTrue(matched.contains("symbolic reasoning = 符号推理"))
+        expectTrue(!matched.contains("self-attention"))
     }
 
     func testRewriteMultifilePaper() throws {
@@ -50,6 +63,11 @@ struct PaperCoreTests {
         \author{Alice Author}
         \begin{document}
         \maketitle
+        \begin{abstract}
+        We achieve 28.4 points. This result is significant.
+        \end{abstract}
+        \vskip 0.15in
+        \aboverulesep = 0.2em \belowrulesep = 0.2em
         \section[Short Title]{Full Title}
         \input{body}
         \begin{thebibliography}{9}
@@ -69,7 +87,7 @@ struct PaperCoreTests {
         expectEqual(project.root.path, root.resolvingSymlinksInPath().path)
         expectEqual(project.title, "Important Results")
         expectEqual(project.drafts.count, 2)
-        expectEqual(project.drafts[0].units.map(\.prompt), ["Important Results", "Short Title", "Full Title"])
+        expectEqual(project.drafts[0].units.map(\.prompt), ["Important Results", "We achieve ZXQ0000QXZ points.", "This result is significant.", "Short Title", "Full Title"])
         let units = project.drafts[1].units
         expectEqual(units.count, 2)
         expectTrue(units[0].tokens.joined().contains(#"\(x_i\)"#))
@@ -83,6 +101,10 @@ struct PaperCoreTests {
         expectTrue(output.contains(#"\author{Alice Author}"#))
         expectTrue(output.contains(#"\bibitem{x} Example Work."#))
         expectTrue(output.contains(#"\usepackage{xeCJK}"#))
+        expectTrue(output.contains(#"\vskip 0.15in"#))
+        expectTrue(output.contains(#"\aboverulesep = 0.2em \belowrulesep = 0.2em"#))
+        expectTrue(output.contains(#"\setstretch{1.16}"#))
+        expectTrue(output.contains(#"\patchcmd{\abstract}{Abstract}{摘要}"#))
         let translated = try String(contentsOf: body, encoding: .utf8)
         expectTrue(translated.contains(#"\includegraphics[width=0.5\textwidth]{chart}"#))
         expectTrue(translated.contains(#"\begin{equation}x = y \label{eq:a}\end{equation}"#))

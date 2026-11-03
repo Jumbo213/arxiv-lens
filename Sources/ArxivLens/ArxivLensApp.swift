@@ -90,7 +90,8 @@ final class LibraryStore: ObservableObject {
         let settings: TranslationSettings
         do {
             settings = try TranslationSettings(url: endpoint, model: model, key: Keychain.read(),
-                glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "")
+                glossary: defaults.string(forKey: "glossary") ?? "", texPath: defaults.string(forKey: "texPath") ?? "",
+                lineSpacing: LineSpacing(rawValue: defaults.string(forKey: "lineSpacing") ?? "") ?? .comfortable)
         } catch {
             settingsOpen = true
             return

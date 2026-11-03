@@ -4,6 +4,7 @@ private let documentStart = try! NSRegularExpression(pattern: #"\\begin\s*\{\s*d
 private let documentEnd = try! NSRegularExpression(pattern: #"\\end\s*\{\s*document\s*\}"#)
 private let documentClass = try! NSRegularExpression(pattern: #"\\documentclass\s*(?:\[[^\]]*\]\s*)?\{([^{}]+)\}"#)
 private let titleCommand = try! NSRegularExpression(pattern: #"\\(?:title|subtitle|shorttitle)\s*(?:\[[^\]]*\]\s*)?\{"#)
+private let abstractCommand = try! NSRegularExpression(pattern: #"\\abstract\s*\{"#)
 private let include = try! NSRegularExpression(pattern: #"\\(?:input|include|subfile|subfileinclude)\s*\{\s*([^{}\s]+)\s*\}|\\input[ \t]+([\w./-]+)"#)
 private let imports = try! NSRegularExpression(pattern: #"\\(?:subimport|import|inputfrom|includefrom|subinputfrom|subincludefrom)\s*\{([^{}]*)\}\s*\{([^{}]+)\}"#)
 private let comments = try! NSRegularExpression(pattern: #"(?<!\\)(?:\\\\)*(%[^\r\n]*)"#)
@@ -31,6 +32,13 @@ struct TranslationUnit: Sendable {
 
     static func marker(_ index: Int) -> String { String(format: "ZXQ%04dQXZ", index) }
 
+    var numericTokens: [Int: String] {
+        Dictionary(uniqueKeysWithValues: tokens.enumerated().compactMap { index, value in
+            value.range(of: #"\A[+-]?\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?(?:\\%)?\z"#,
+                        options: .regularExpression) != nil ? (index, value) : nil
+        })
+    }
+
     func restore(_ translated: String) -> String? {
         let translated = translated.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !translated.isEmpty, translated.utf16.count < max(350, prompt.utf16.count * 4),
@@ -41,7 +49,10 @@ struct TranslationUnit: Sendable {
         guard hasChinese || unchangedName else { return nil }
         let input = translated as NSString
         let markers = Self.marker.matches(translated)
-        guard markers.map({ input.substring(with: $0.range) }) == tokens.indices.map(Self.marker) else { return nil }
+        let order = markers.compactMap { Int(input.substring(with: $0.range).dropFirst(3).prefix(4)) }
+        let numbers = numericTokens
+        guard order.sorted() == Array(tokens.indices),
+              order.filter({ numbers[$0] == nil }) == tokens.indices.filter({ numbers[$0] == nil }) else { return nil }
         let escapes: [Character: String] = [
             "\\": "\\textbackslash{}", "{": "\\{", "}": "\\}", "%": "\\%", "&": "\\&",
             "#": "\\#", "_": "\\_", "$": "\\$", "~": "\\textasciitilde{}", "^": "\\textasciicircum{}"
@@ -53,7 +64,7 @@ struct TranslationUnit: Sendable {
         }
         var cursor = 0
         var result = ""
-        for (index, marker) in markers.enumerated() {
+        for (index, marker) in zip(order, markers) {
             result += prose(NSRange(location: cursor, length: marker.range.location - cursor))
             result += tokens[index]
             cursor = NSMaxRange(marker.range)
@@ -68,7 +79,7 @@ struct TeXDraft {
     let units: [TranslationUnit]
     let documentOffset: Int?
 
-    func write(_ translations: [String?], font: String) throws {
+    func write(_ translations: [String?], font: String, lineSpacing: LineSpacing = .comfortable) throws {
         let output = NSMutableString(string: content)
         let alreadySupportsChinese = uncomment(content).range(
             of: #"\\(?:usepackage\s*(?:\[[^\]]*\])?\s*\{[^}]*\b(?:xeCJK|ctex)\b|documentclass\s*(?:\[[^\]]*\])?\s*\{ctex\w+)"#,
@@ -83,15 +94,29 @@ struct TeXDraft {
                 }
             }
         }
-        if let offset, !alreadySupportsChinese {
-            output.insert("""
+        if let offset {
+            let fontSetup = alreadySupportsChinese ? "" : """
 
-            % Arxiv Lens: Chinese font support.
             \\usepackage{xeCJK}
             \\setCJKmainfont[AutoFakeBold=2,AutoFakeSlant=.2]{\(font)}
             \\setCJKsansfont[AutoFakeBold=2]{\(font)}
             \\setCJKmonofont{\(font)}
+
+            """
+            let spacingSetup = lineSpacing == .original ? "" : """
+
+            \\usepackage{setspace}
+            \\AtBeginDocument{\\setstretch{\(lineSpacing.factor)}}
+
+            """
+            output.insert("""
+
+            % Arxiv Lens: Chinese typography and reading line spacing.
+            \(fontSetup)
+            \(spacingSetup)
+            \\usepackage{etoolbox}
             \\AtBeginDocument{\\ifdefined\\abstractname\\renewcommand{\\abstractname}{摘要}\\fi}
+            \\AtBeginDocument{\\ifdefined\\abstract\\patchcmd{\\abstract}{Abstract}{摘要}{}{}\\fi}
             \\AtBeginDocument{\\ifdefined\\refname\\renewcommand{\\refname}{参考文献}\\fi}
             \\AtBeginDocument{\\ifdefined\\bibname\\renewcommand{\\bibname}{参考文献}\\fi}
 
@@ -140,15 +165,17 @@ struct TeXProject {
             let end = documentEnd.matches(clean).last?.range.location ?? ns.length
             var scanner = Scanner(content)
             if let start {
-                for match in titleCommand.matches(clean) where NSMaxRange(match.range) < start.location {
+                let metadata = (titleCommand.matches(clean).map { ($0, false) } + abstractCommand.matches(clean).map { ($0, true) })
+                    .sorted { $0.0.range.location < $1.0.range.location }
+                for (match, isAbstract) in metadata where NSMaxRange(match.range) < start.location {
                     if let group = scanner.group(at: NSMaxRange(match.range) - 1) {
                         let body = NSRange(location: group.location + 1, length: group.length - 2)
-                        if url == root && title == nil {
+                        if url == root && title == nil && !isAbstract {
                             title = ns.substring(with: body)
                                 .replacingOccurrences(of: #"\\[a-zA-Z]+\*?|[{}$]"#, with: "", options: .regularExpression)
                                 .split(whereSeparator: \.isWhitespace).joined(separator: " ")
                         }
-                        scanner.scan(from: body.location, to: NSMaxRange(body))
+                        scanner.scan(from: body.location, to: NSMaxRange(body), sentenceUnits: isAbstract)
                     }
                 }
             }
@@ -206,6 +233,13 @@ private struct Scanner {
     private static let word = try! NSRegularExpression(pattern: #"[a-z]{2,}"#, options: .caseInsensitive)
     private static let command = try! NSRegularExpression(pattern: #"\\(?:[a-zA-Z@]+\*?|[^\r\n])"#)
     private static let identifier = try! NSRegularExpression(pattern: #"https?://[^\s{}\\]+|(?<![\w.])[+-]?\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?(?![\w]|\.\d)"#)
+    private static let sentenceBreak = try! NSRegularExpression(
+        pattern: #"(?<!\bet al)(?<!\bFig)(?<!\bEq)(?<!\be\.g)(?<!\bi\.e)[.!?](?=[ \t\r\n]+[A-Z])"#
+    )
+    private static let assignment = try! NSRegularExpression(pattern: #"[ \t]*=[ \t]*[+\-0-9.\\]"#)
+    private static let unbracedCommands: Set<String> = [
+        "vskip", "hskip", "kern", "mkern", "mskip", "penalty", "looseness", "hangindent", "hangafter", "setbox"
+    ]
     private static let blank = try! NSRegularExpression(pattern: #"\r?\n[ \t]*\r?\n"#)
     private static let opaqueEnvironment = try! NSRegularExpression(
         pattern: #"^(?:equation|align|alignat|gather|flalign|multline|eqnarray|split|aligned|cases|matrix|pmatrix|bmatrix|math|displaymath|IEEEeqnarray|thebibliography|filecontents|verbatim|Verbatim|lstlisting|minted|tikzpicture|pgfpicture|comment)\*?$"#
@@ -248,8 +282,8 @@ private struct Scanner {
         return nil
     }
 
-    mutating func scan(from: Int, to: Int) {
-        walk(from: from, to: to)
+    mutating func scan(from: Int, to: Int, sentenceUnits: Bool = false) {
+        walk(from: from, to: to, sentenceUnits: sentenceUnits)
         flush()
     }
 
@@ -281,7 +315,7 @@ private struct Scanner {
         return groups
     }
 
-    private mutating func walk(from: Int, to: Int) {
+    private mutating func walk(from: Int, to: Int, sentenceUnits: Bool = false) {
         let oldLimit = limit
         limit = to
         defer { limit = oldLimit }
@@ -294,6 +328,10 @@ private struct Scanner {
             } else if c == 10 || c == 13, let blank = match(Self.blank, at: i, to: to) {
                 flush()
                 i = NSMaxRange(blank)
+            } else if sentenceUnits, [33, 46, 63].contains(c), match(Self.sentenceBreak, at: i, to: to) != nil {
+                append(i, i + 1, protected: false)
+                flush()
+                i += 1
             } else if c == 36 {
                 let delimiter = i + 1 < to && text.character(at: i + 1) == 36 ? "$$" : "$"
                 let end = close(delimiter, after: i + delimiter.count, to: to) ?? to
@@ -347,11 +385,25 @@ private struct Scanner {
             append(start, final, protected: true)
             return final
         }
+        if Self.unbracedCommands.contains(name) || match(Self.assignment, at: end, to: to) != nil {
+            flush()
+            return newline(after: end)
+        }
         let args = groups(after: end)
         let last = args.last.map(NSMaxRange) ?? end
         let required = args.filter { text.character(at: $0.location) == 123 }
         if name == "begin", let environment = required.first {
             let env = slice(environment.location + 1, NSMaxRange(environment) - 1)
+            if env == "abstract" {
+                let tail = text.range(of: "\\end{abstract}", options: [],
+                                      range: NSRange(location: last, length: to - last))
+                if tail.location != NSNotFound {
+                    flush()
+                    walk(from: last, to: tail.location, sentenceUnits: true)
+                    flush()
+                    return NSMaxRange(tail)
+                }
+            }
             if Self.opaqueEnvironment.matches(env).first != nil {
                 let tail = text.range(of: "\\end{\(env)}", options: [],
                                       range: NSRange(location: NSMaxRange(environment), length: to - NSMaxRange(environment)))
@@ -362,7 +414,7 @@ private struct Scanner {
         if Self.headings.contains(name) {
             flush()
             for argument in args.dropFirst(name == "captionof" ? 1 : 0).prefix(2) {
-                walk(from: argument.location + 1, to: NSMaxRange(argument) - 1)
+                walk(from: argument.location + 1, to: NSMaxRange(argument) - 1, sentenceUnits: name == "abstract")
                 flush()
             }
             return last

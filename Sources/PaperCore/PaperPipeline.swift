@@ -80,6 +80,10 @@ public enum PaperPipeline {
                                                                     title: title, context: context, retry: true)
                             for (index, value) in zip(chunk, recovered) { replies[index] = value }
                         }
+                        for index in failed where replies[index] == nil {
+                            replies[index] = try await api.translate([missing[index]][...], title: title,
+                                                                     context: "", retry: true).first ?? nil
+                        }
                     }
                     var next = 0
                     for i in batch.indices where batch[i] == nil {
@@ -102,7 +106,7 @@ public enum PaperPipeline {
                 start = end
             }
             let font = NSFont(name: "Songti SC", size: 12) != nil ? "Songti SC" : "Heiti SC"
-            try draft.write(translations, font: font)
+            try draft.write(translations, font: font, lineSpacing: settings.lineSpacing)
         }
         guard untranslated < count else { throw LensError("模型未返回可用的中文译文。请检查模型和接口。") }
 

@@ -15,6 +15,7 @@ enum Palette {
 
 struct WorkspaceView: View {
     @ObservedObject var store: LibraryStore
+    @AppStorage("compactReader") private var compactReader = true
     @ViewState private var search = ""
     @FocusState private var linkFocused: Bool
 
@@ -29,11 +30,13 @@ struct WorkspaceView: View {
             sidebar
                 .frame(width: 254)
             VStack(spacing: 0) {
-                toolbar
-                Rectangle().fill(Palette.line).frame(height: 1)
+                if store.selected == nil || !compactReader {
+                    toolbar
+                    Rectangle().fill(Palette.line).frame(height: 1)
+                }
                 if let job = store.job { progress(job) }
                 if let paper = store.selected {
-                    ReaderView(paper: paper).id(paper.id)
+                    ReaderView(paper: paper, compact: $compactReader).id(paper.id)
                 } else {
                     emptyState
                 }

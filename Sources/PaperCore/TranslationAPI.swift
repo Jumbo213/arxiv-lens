@@ -1,13 +1,27 @@
 import Foundation
 
+public enum LineSpacing: String, CaseIterable, Sendable {
+    case original, comfortable, spacious
+
+    var factor: String {
+        switch self {
+        case .original: return "1"
+        case .comfortable: return "1.16"
+        case .spacious: return "1.25"
+        }
+    }
+}
+
 public struct TranslationSettings: Sendable {
     public let endpoint: URL
     public let model: String
     public let key: String
     public let glossary: String
     public let texPath: String
+    public let lineSpacing: LineSpacing
 
-    public init(url: String, model: String, key: String, glossary: String = "", texPath: String = "") throws {
+    public init(url: String, model: String, key: String, glossary: String = "", texPath: String = "",
+                lineSpacing: LineSpacing = .comfortable) throws {
         let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: url), let host = components.host?.lowercased(),
               components.user == nil, components.password == nil, components.fragment == nil,
@@ -36,6 +50,7 @@ public struct TranslationSettings: Sendable {
         self.key = key
         self.glossary = String(glossary.prefix(6000))
         self.texPath = texPath
+        self.lineSpacing = lineSpacing
     }
 
     public func checkAPI() async throws {
@@ -121,18 +136,27 @@ struct TranslationAPI: Sendable {
         to its translated text, for example {"s1":"研究结果","s2":"实验设置"}. Return every key once.
         Use concise and natural Chinese academic prose.
         Preserve claims, uncertainty, negation, quantities, experimental comparisons and terminology.
-        Preserve every ZXQnnnnQXZ marker verbatim and in exactly the original order, including repeated structure.
-        A marker can stand for a numeric value, a citation, mathematics, or LaTeX formatting. It has no Chinese translation.
+        Preserve every ZXQnnnnQXZ marker exactly once and verbatim. Keep citation, math and formatting markers in
+        their original order. Markers listed in numeric_values represent numbers and may move to fit Chinese word order.
+        Keep each number attached to the same quantity or claim as in the source. Emit its marker, never the number itself.
+        Translate paper titles, abstracts and section headings even for famous papers.
         Do not invent facts, LaTeX, Markdown, summaries, introductions or explanatory notes.
+        Apply custom_terms first, then use matching built-in preferred_terms when appropriate.
         Keep model names and standard acronyms when useful. If a short item is exclusively a model name,
         metric or acronym, copy the item exactly. Use consistent Chinese translations for technical terms.
         """
         let ids = units.indices.map { "s\($0 + 1)" }
         let excerpts = Dictionary(uniqueKeysWithValues: zip(ids, units.map(\.prompt)))
+        var numbers: [String: [String: String]] = [:]
+        for (id, unit) in zip(ids, units) where !unit.numericTokens.isEmpty {
+            numbers[id] = Dictionary(uniqueKeysWithValues: unit.numericTokens.map { (TranslationUnit.marker($0.key), $0.value) })
+        }
+        let preferred = GlossaryCatalog.relevant(to: ([title] + units.map(\.prompt)).joined(separator: "\n"),
+                                                  custom: settings.glossary)
         let payload: [String: Any] = [
-            "paper": title, "preferred_terms": settings.glossary,
+            "paper": title, "preferred_terms": preferred, "custom_terms": settings.glossary,
             "preceding_translation_for_terminology_only": context,
-            "strict_marker_check_retry": retry, "excerpts": excerpts
+            "strict_marker_check_retry": retry, "excerpts": excerpts, "numeric_values": numbers
         ]
         let data = try JSONSerialization.data(withJSONObject: payload)
         let reply = try await ask(system: system, user: String(decoding: data, as: UTF8.self), json: true)
