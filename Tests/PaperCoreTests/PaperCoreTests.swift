@@ -22,6 +22,13 @@ struct PaperCoreTests {
     }
 
     func testArxivLinkAndEndpointNormalization() throws {
+        let root = try APIConnection(url: "https://example.com", key: "test")
+        expectEqual(root.modelsURL.path, "/v1/models")
+        let prefixed = try APIConnection(url: "https://example.com/proxy/v1/chat/completions/?region=us", key: "test")
+        expectEqual(prefixed.modelsURL.path, "/proxy/v1/models")
+        expectEqual(prefixed.modelsURL.query, "region=us")
+        expectEqual(try APIConnection(url: "http://127.0.0.1:8080/v1", key: "").modelsURL.path, "/v1/models")
+        expectThrowsError(try APIConnection(url: "https://example.com/v1", key: ""))
         expectEqual(try ArxivID("https://arxiv.org/pdf/hep-th/9901001v2.pdf?x=1").value, "hep-th/9901001v2")
         expectEqual(try ArxivID(" arXiv:1706.03762v7 ").value, "1706.03762v7")
         expectThrowsError(try ArxivID("https://arxiv.org.evil.example/abs/1706.03762"))
@@ -82,6 +89,11 @@ struct PaperCoreTests {
     func testCatalogAPI() async throws {
         guard let endpoint = ProcessInfo.processInfo.environment["ARXIV_LENS_TEST_ENDPOINT"] else { return }
         let settings = try TranslationSettings(url: endpoint, model: "mock", key: "")
+        let connection = try APIConnection(url: endpoint + "/chat/completions?fixture=1", key: "fixture-model-key")
+        let models = try await connection.listModels()
+        expectEqual(models.map(\.id), ["sample-model-2", "sample-model-10"])
+        expectEqual(models.last?.name, "Sample Ten")
+        print("VERIFIED authenticated model list, duplicates removed, model names preserved")
         let a = Paper(id: UUID(), arxivID: "1706.03762v7", title: "Attention Is All You Need",
                       completedAt: .now, untranslated: 0,
                       metadata: PaperMetadata(abstract: "A study of Transformer attention.",

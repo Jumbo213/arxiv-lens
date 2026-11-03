@@ -5,6 +5,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/v1/models?fixture=1":
+            self.send_error(404)
+            return
+        if self.headers.get("Authorization") != "Bearer fixture-model-key":
+            self.send_error(401)
+            return
+        self.send_json({"data": [{"id": "sample-model-10", "name": "Sample Ten"},
+                                 {"id": "sample-model-2"}, {"id": "sample-model-2"}, {"id": " "}]})
+
     def do_POST(self):
         if self.path != "/v1/chat/completions":
             self.send_error(404)
@@ -28,7 +38,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 answer = {index: "译文 " + text for index, text in payload["excerpts"].items()}
             content = json.dumps(answer, ensure_ascii=False)
-        response = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+        self.send_json({"choices": [{"message": {"content": content}}]})
+
+    def send_json(self, value):
+        response = json.dumps(value).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))

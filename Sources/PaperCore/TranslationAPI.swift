@@ -12,18 +12,20 @@ public enum LineSpacing: String, CaseIterable, Sendable {
     }
 }
 
-public struct TranslationSettings: Sendable {
-    public let endpoint: URL
-    public let model: String
-    public let key: String
-    public let glossary: String
-    public let texPath: String
-    public let lineSpacing: LineSpacing
+public struct AvailableModel: Identifiable, Sendable {
+    public let id: String
+    public let name: String?
+}
 
-    public init(url: String, model: String, key: String, glossary: String = "", texPath: String = "",
-                lineSpacing: LineSpacing = .comfortable) throws {
+public struct APIConnection: Hashable, Sendable {
+    public let endpoint: URL
+    public let modelsURL: URL
+    let key: String
+    public var hasKey: Bool { !key.isEmpty }
+
+    public init(url: String, key: String) throws {
         let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard var components = URLComponents(string: url), let host = components.host?.lowercased(),
+        guard var components = URLComponents(string: url), let host = components.host?.lowercased(), !host.isEmpty,
               components.user == nil, components.password == nil, components.fragment == nil,
               components.scheme?.lowercased() == "https" ||
                 (components.scheme?.lowercased() == "http" && ["localhost", "127.0.0.1", "[::1]", "::1"].contains(host)) else {
@@ -39,15 +41,66 @@ public struct TranslationSettings: Sendable {
             components.percentEncodedPath = normalized
         }
         guard let endpoint = components.url else { throw LensError("API 地址格式有误。") }
-        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !model.isEmpty else { throw LensError("请填写模型 ID。") }
         guard !key.isEmpty || ["localhost", "127.0.0.1", "[::1]", "::1"].contains(host) else {
             throw LensError("请填写 API Key。")
         }
+        components.percentEncodedPath = String(components.percentEncodedPath.dropLast("/chat/completions".count)) + "/models"
+        guard let modelsURL = components.url else { throw LensError("模型列表地址格式有误。") }
         self.endpoint = endpoint
-        self.model = model
+        self.modelsURL = modelsURL
         self.key = key
+    }
+
+    public func listModels() async throws -> [AvailableModel] {
+        var request = URLRequest(url: modelsURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if hasKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await TranslationAPI.session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw LensError("无法读取模型列表的响应。") }
+        switch http.statusCode {
+        case 200..<300: break
+        case 401, 403:
+            throw LensError("获取模型列表时鉴权失败（HTTP \(http.statusCode)）。请检查 API Key。")
+        default:
+            throw LensError("模型列表暂时不可用（HTTP \(http.statusCode)）。可以手动填写模型 ID。")
+        }
+        guard let list = try? JSONDecoder().decode(ModelList.self, from: data) else {
+            throw LensError("接口返回的模型列表格式无法识别。可以手动填写模型 ID。")
+        }
+        var seen = Set<String>()
+        return list.data.compactMap { row -> AvailableModel? in
+            guard let id = row.id?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty,
+                  seen.insert(id).inserted else { return nil }
+            return AvailableModel(id: id, name: row.name)
+        }.sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    }
+
+    private struct ModelList: Decodable {
+        struct Row: Decodable {
+            let id: String?
+            let name: String?
+        }
+        let data: [Row]
+    }
+}
+
+public struct TranslationSettings: Sendable {
+    public let endpoint: URL
+    public let model: String
+    public let key: String
+    public let glossary: String
+    public let texPath: String
+    public let lineSpacing: LineSpacing
+
+    public init(url: String, model: String, key: String, glossary: String = "", texPath: String = "",
+                lineSpacing: LineSpacing = .comfortable) throws {
+        let connection = try APIConnection(url: url, key: key)
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else { throw LensError("请填写模型 ID。") }
+        self.endpoint = connection.endpoint
+        self.model = model
+        self.key = connection.key
         self.glossary = String(glossary.prefix(6000))
         self.texPath = texPath
         self.lineSpacing = lineSpacing
@@ -73,7 +126,7 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
 
 struct TranslationAPI: Sendable {
     let settings: TranslationSettings
-    private static let session = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
+    fileprivate static let session = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
 
     private struct Response: Decodable {
         struct Choice: Decodable {
