@@ -19,10 +19,16 @@ struct WorkspaceView: View {
     @ViewState private var search = ""
     @FocusState private var linkFocused: Bool
 
-    private var filtered: [Paper] {
+    private var history: [Paper.HistoryEntry] { Paper.groupedHistory(store.papers) }
+
+    private var filtered: [Paper.HistoryEntry] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        if query.isEmpty { return store.papers }
-        return store.papers.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.arxivID.contains(query) }
+        if query.isEmpty { return history }
+        return history.filter { entry in
+            entry.translations.contains { paper in
+                paper.title.localizedCaseInsensitiveContains(query) || paper.arxivID.localizedCaseInsensitiveContains(query)
+            }
+        }
     }
 
     var body: some View {
@@ -36,7 +42,10 @@ struct WorkspaceView: View {
                 }
                 if let job = store.job { progress(job) }
                 if let paper = store.selected {
-                    ReaderView(paper: paper, compact: $compactReader).id(paper.id)
+                    ReaderView(paper: paper, compact: $compactReader,
+                               translations: history.first { $0.id == paper.paperID }?.translations ?? []) {
+                        store.selected = $0
+                    }.id(paper.id)
                 } else {
                     emptyState
                 }
@@ -98,7 +107,7 @@ struct WorkspaceView: View {
             HStack {
                 Text("翻译历史").font(.system(size: 11, weight: .semibold))
                 Spacer()
-                Text("\(store.papers.count)").font(.system(size: 10, design: .monospaced))
+                Text("\(history.count)").font(.system(size: 10, design: .monospaced))
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(.white.opacity(0.09), in: Capsule())
             }
@@ -109,8 +118,9 @@ struct WorkspaceView: View {
 
             ScrollView {
                 LazyVStack(spacing: 5) {
-                    ForEach(filtered) { paper in
-                        let active = paper == store.selected
+                    ForEach(filtered) { entry in
+                        let paper = entry.latest
+                        let active = entry.id == store.selected?.paperID
                         Button { store.selected = paper } label: {
                             HStack(alignment: .top, spacing: 9) {
                                 Image(systemName: "doc.text").font(.system(size: 12))
@@ -120,8 +130,14 @@ struct WorkspaceView: View {
                                         .font(.system(size: 12, weight: active ? .semibold : .medium))
                                         .foregroundStyle(.white)
                                         .fixedSize(horizontal: false, vertical: true)
-                                    Text(paper.arxivID)
-                                        .font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.soft)
+                                    HStack(spacing: 7) {
+                                        Text(paper.arxivID)
+                                            .font(.system(size: 10, design: .monospaced))
+                                        if entry.translations.count > 1 {
+                                            Text("\(entry.translations.count) 个译本").font(.system(size: 10))
+                                        }
+                                    }
+                                    .foregroundStyle(Palette.soft)
                                 }
                                 Spacer(minLength: 0)
                             }

@@ -9,6 +9,7 @@ struct PaperCoreTests {
             try tests.testArxivLinkAndEndpointNormalization()
             try tests.testProtectedTokensRejectReorderAndEscapeProse()
             tests.testGlossary()
+            tests.testHistoryGroups()
             try tests.testRewriteMultifilePaper()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
             print("All smoke tests passed.")
@@ -40,6 +41,20 @@ struct PaperCoreTests {
                                       prompt: "ZXQ0000QXZ points on ZXQ0001QXZ.", tokens: ["28.4", "2014"])
         expectEqual(numeric.restore("在 ZXQ0001QXZ 年获得 ZXQ0000QXZ 分。"), "在 2014 年获得 28.4 分。")
         expectEqual(unit.restore("参见 ZXQ0000QXZ 与 ZXQ0001QXZ，%和&。"), #"参见 $x_i$ 与 \cite{x}，\%和\&。"#)
+    }
+
+    func testHistoryGroups() {
+        let first = Paper(id: UUID(), arxivID: "1706.03762v1", title: "Old title",
+                          completedAt: Date(timeIntervalSince1970: 1), untranslated: 0)
+        let second = Paper(id: UUID(), arxivID: "1706.03762v7", title: "Same paper",
+                           completedAt: Date(timeIntervalSince1970: 3), untranslated: 1)
+        let distinct = Paper(id: UUID(), arxivID: "1801.00001", title: second.title,
+                             completedAt: Date(timeIntervalSince1970: 2), untranslated: 0)
+        let groups = Paper.groupedHistory([first, distinct, second])
+        expectEqual(groups.count, 2)
+        expectEqual(groups[0].id, "1706.03762")
+        expectEqual(groups[0].translations, [second, first])
+        expectEqual(groups[1].translations, [distinct])
     }
 
     func testGlossary() {

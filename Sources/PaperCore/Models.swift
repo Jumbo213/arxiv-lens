@@ -32,6 +32,10 @@ public struct ArxivID: Hashable, Sendable {
         value = id
     }
 
+    public var paperID: String {
+        value.replacingOccurrences(of: #"v[0-9]+$"#, with: "", options: .regularExpression).lowercased()
+    }
+
     public var abstractURL: URL { url("abs") }
     func url(_ type: String) -> URL { URL(string: "https://arxiv.org/\(type)/\(value)")! }
 }
@@ -42,6 +46,7 @@ public struct Paper: Codable, Identifiable, Hashable, Sendable {
     public let title: String
     public let completedAt: Date
     public let untranslated: Int
+    public var paperID: String { (try? ArxivID(arxivID).paperID) ?? arxivID }
     public var originalURL: URL { directory.appendingPathComponent("original.pdf") }
     public var translationURL: URL { directory.appendingPathComponent("chinese.pdf") }
     public var sourceURL: URL { directory.appendingPathComponent("source", isDirectory: true) }
@@ -52,6 +57,22 @@ public struct Paper: Codable, Identifiable, Hashable, Sendable {
             .appendingPathComponent("ArxivLens", isDirectory: true)
     }
     public static var library: URL { support.appendingPathComponent("Papers", isDirectory: true) }
+
+    public struct HistoryEntry: Identifiable, Sendable {
+        public let id: String
+        public let translations: [Paper]
+        public var latest: Paper { translations[0] }
+    }
+
+    public static func groupedHistory(_ papers: [Paper]) -> [HistoryEntry] {
+        let grouped = Dictionary(grouping: papers, by: \.paperID)
+        return grouped.map { id, entries in
+            HistoryEntry(id: id, translations: entries.sorted { $0.completedAt > $1.completedAt })
+        }.sorted {
+            if $0.latest.completedAt == $1.latest.completedAt { return $0.id < $1.id }
+            return $0.latest.completedAt > $1.latest.completedAt
+        }
+    }
 
     public static func history() -> [Paper] {
         let directories = (try? FileManager.default.contentsOfDirectory(at: library, includingPropertiesForKeys: nil)) ?? []

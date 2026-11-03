@@ -82,13 +82,17 @@ private final class ReaderState: ObservableObject {
 struct ReaderView: View {
     let paper: Paper
     @Binding var compact: Bool
+    let translations: [Paper]
+    let selectTranslation: (Paper) -> Void
     @StateObject private var reader: ReaderState
     @ViewState private var zoom: CGFloat = 1
     @ViewState private var exportError: String?
 
-    init(paper: Paper, compact: Binding<Bool>) {
+    init(paper: Paper, compact: Binding<Bool>, translations: [Paper], selectTranslation: @escaping (Paper) -> Void) {
         self.paper = paper
         _compact = compact
+        self.translations = translations
+        self.selectTranslation = selectTranslation
         _reader = StateObject(wrappedValue: ReaderState(paper))
     }
 
@@ -180,6 +184,19 @@ struct ReaderView: View {
         Menu {
             Button("导出英文 PDF…") { export(.original) }
             Button("导出中文 PDF…") { export(.chinese) }
+            if translations.count > 1 {
+                Menu("此文献的译本") {
+                    ForEach(translations) { translation in
+                        Button {
+                            selectTranslation(translation)
+                        } label: {
+                            let date = translation.completedAt.formatted(.dateTime.month().day().hour().minute().second())
+                            Label("\(translation.arxivID) · \(date)",
+                                  systemImage: translation.id == paper.id ? "checkmark.circle" : "doc")
+                        }
+                    }
+                }
+            }
             Divider()
             Button("在访达中显示译后 TeX") {
                 NSWorkspace.shared.open(paper.sourceURL)
