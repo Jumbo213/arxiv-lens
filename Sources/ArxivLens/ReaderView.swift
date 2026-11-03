@@ -86,21 +86,26 @@ struct ReaderView: View {
     let originalRequest: UUID?
     let translations: [Paper]
     let busy: Bool
+    let pendingSource: URL?
     let selectTranslation: (Paper) -> Void
     let translate: () -> Void
+    let recompile: () -> Void
     @StateObject private var reader: ReaderState
     @ViewState private var zoom: CGFloat = 1
     @ViewState private var exportError: String?
 
     init(paper: Paper, compact: Binding<Bool>, originalRequest: UUID?, translations: [Paper], busy: Bool,
-         selectTranslation: @escaping (Paper) -> Void, translate: @escaping () -> Void) {
+         pendingSource: URL?, selectTranslation: @escaping (Paper) -> Void, translate: @escaping () -> Void,
+         recompile: @escaping () -> Void) {
         self.paper = paper
         _compact = compact
         self.originalRequest = originalRequest
         self.translations = translations
         self.busy = busy
+        self.pendingSource = pendingSource
         self.selectTranslation = selectTranslation
         self.translate = translate
+        self.recompile = recompile
         _reader = StateObject(wrappedValue: ReaderState(paper, showOriginal: originalRequest != nil))
     }
 
@@ -163,7 +168,13 @@ struct ReaderView: View {
                 } else {
                     Label("已保存原文", systemImage: "doc.text")
                         .font(.system(size: 12)).foregroundStyle(Palette.teal)
-                    Button("翻译这篇论文", action: translate).disabled(busy)
+                    if pendingSource == nil {
+                        Button("翻译这篇论文", action: translate).disabled(busy)
+                    }
+                }
+                if pendingSource != nil {
+                    Button("重新编译", action: recompile).disabled(busy)
+                        .help("使用已保存的译后 TeX 在本机编译")
                 }
                 Spacer(minLength: 4)
                 if paper.untranslated > 0 {
@@ -197,8 +208,14 @@ struct ReaderView: View {
 
     private var fileMenu: some View {
         Menu {
-            Button(paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文", action: translate)
+            if let pendingSource {
+                Button("重新编译", action: recompile).disabled(busy)
+                Button("在访达中显示待编译译稿") { NSWorkspace.shared.open(pendingSource) }
+                Button("重新翻译（调用 API）", action: translate).disabled(busy)
+            } else {
+                Button(paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文", action: translate)
                 .disabled(busy)
+            }
             Divider()
             Button("导出原版 PDF…") { export(.original) }
             if paper.hasTranslation {

@@ -35,8 +35,10 @@ struct WorkspaceView: View {
                     ReaderView(paper: paper, compact: $compactReader, originalRequest: store.originalRequest,
                                translations: history.first { $0.id == paper.paperID }?.translations ?? [],
                                busy: store.isBusy(paper.paperID),
+                               pendingSource: PaperPipeline.pendingSource(for: paper),
                                selectTranslation: { store.select($0) },
-                               translate: { store.start(paper: paper) })
+                               translate: { store.start(paper: paper) },
+                               recompile: { store.recompile(paper) })
                         .id(paper.id)
                 } else {
                     emptyState
@@ -140,7 +142,7 @@ struct WorkspaceView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(job.title).font(.system(size: 12, weight: .semibold)).lineLimit(1).help(job.title)
             HStack(spacing: 8) {
-                Text(job.downloadOnly ? "下载" : "翻译").foregroundStyle(Palette.teal)
+                Text(job.kind).foregroundStyle(Palette.teal)
                 switch job.phase {
                 case .queued:
                     Text("排队中")
@@ -157,6 +159,9 @@ struct WorkspaceView: View {
                 case .failed(let issue):
                     Text("未完成")
                     Spacer()
+                    if let paper = job.original, PaperPipeline.pendingSource(for: paper) != nil {
+                        Button("重新编译") { store.recompile(paper) }
+                    }
                     Button("详情") {
                         jobsOpen = false
                         store.failure = issue

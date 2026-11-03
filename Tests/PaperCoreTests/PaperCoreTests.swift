@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import PDFKit
 
@@ -15,6 +16,7 @@ struct PaperCoreTests {
             try await tests.testCatalogAPI()
             try await tests.testAPIKeyRotation()
             try tests.testRewriteMultifilePaper()
+            try await tests.testCompileRetryUsesSavedTranslation()
             try await tests.testLiveArxivThroughMockTranslationAndXeLaTeX()
             print("All smoke tests passed.")
         } catch {
@@ -64,6 +66,9 @@ struct PaperCoreTests {
                                       prompt: "ZXQ0000QXZ points on ZXQ0001QXZ.", tokens: ["28.4", "2014"])
         expectEqual(numeric.restore("在 ZXQ0001QXZ 年获得 ZXQ0000QXZ 分。"), "在 2014 年获得 28.4 分。")
         expectEqual(unit.restore("参见 ZXQ0000QXZ 与 ZXQ0001QXZ，%和&。"), #"参见 $x_i$ 与 \cite{x}，\%和\&。"#)
+        let command = TranslationUnit(range: NSRange(location: 0, length: 2), prompt: "A ZXQ0000QXZ concept.",
+                                      tokens: [#"~\Target"#])
+        expectEqual(command.restore("将ZXQ0000QXZ中的概念归组。"), #"将~\Target 中的概念归组。"#)
     }
 
     func testHistoryGroups() {
@@ -239,6 +244,11 @@ struct PaperCoreTests {
         \includegraphics[width=0.5\textwidth]{chart}
         \caption{Details for \ref{eq:a}.}
         \end{figure}
+        \begin{tabular}{ll}
+        First & Header \\
+        \cmidrule(lr){1-1}\cmidrule[.3pt](lr{.75em}){2-2}
+        Second & Header \\
+        \end{tabular}
         """#.write(to: body, atomically: true, encoding: .utf8)
         let project = try TeXProject.read(from: folder)
         expectEqual(project.root.path, root.resolvingSymlinksInPath().path)
@@ -246,7 +256,8 @@ struct PaperCoreTests {
         expectEqual(project.drafts.count, 2)
         expectEqual(project.drafts[0].units.map(\.prompt), ["Important Results", "We achieve ZXQ0000QXZ points.", "This result is significant.", "Short Title", "Full Title"])
         let units = project.drafts[1].units
-        expectEqual(units.count, 2)
+        expectEqual(units.count, 6)
+        expectTrue(units.allSatisfy { !$0.prompt.contains("lr") })
         expectTrue(units[0].tokens.joined().contains(#"\(x_i\)"#))
         expectTrue(units[0].tokens.joined().contains("94.5"))
         for draft in project.drafts {
@@ -265,6 +276,70 @@ struct PaperCoreTests {
         let translated = try String(contentsOf: body, encoding: .utf8)
         expectTrue(translated.contains(#"\includegraphics[width=0.5\textwidth]{chart}"#))
         expectTrue(translated.contains(#"\begin{equation}x = y \label{eq:a}\end{equation}"#))
+        expectTrue(translated.contains(#"\cmidrule(lr){1-1}\cmidrule[.3pt](lr{.75em}){2-2}"#))
+    }
+
+    func testCompileRetryUsesSavedTranslation() async throws {
+        guard let endpoint = ProcessInfo.processInfo.environment["ARXIV_LENS_TEST_ENDPOINT"] else { return }
+        let support = try temp()
+        defer { try? FileManager.default.removeItem(at: support) }
+        let original = Paper(id: UUID(), arxivID: "2609.25845v1", title: "Draft fixture", completedAt: .now,
+                             untranslated: 0, downloadOnly: true)
+        let source = original.originalSource(in: support)
+        let folder = original.directory(in: support)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try JSONEncoder().encode(original).write(to: folder.appendingPathComponent("paper.json"))
+        var mediaBox = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let context = try unwrap(CGContext(folder.appendingPathComponent("original.pdf") as CFURL,
+                                           mediaBox: &mediaBox, nil))
+        context.beginPDFPage(nil)
+        context.endPDFPage()
+        context.closePDF()
+        let main = source.appendingPathComponent("main.tex")
+        try #"""
+        \documentclass{article}
+        \usepackage{booktabs}
+        \newcommand{\Target}{Target}
+        \begin{document}
+        This is a paragraph that can be translated.
+        \Target-concepts are described here.
+        \begin{tabular}{ll}
+        First & Header \\
+        \cmidrule(lr){1-2}
+        Second & Header \\
+        \end{tabular}
+        \ArxivLensMissingFixture
+        \end{document}
+        """#.write(to: main, atomically: true, encoding: .utf8)
+
+        let settings = try TranslationSettings(url: endpoint, model: "mock", key: "")
+        do {
+            _ = try await PaperPipeline.run(input: original.arxivID, settings: settings, support: support,
+                                            savedPaper: original) { _ in }
+            preconditionFailure("The fixture must fail to compile")
+        } catch let error as PaperPipeline.CompileFailure {
+            let log = try unwrap(error.logURL)
+            expectTrue(FileManager.default.fileExists(atPath: log.path))
+            expectTrue(error.localizedDescription.contains("ArxivLensMissingFixture"))
+        }
+        expectEqual(Paper.history(in: support), [original])
+        let saved = try unwrap(PaperPipeline.pendingSource(for: original, in: support))
+        let translatedMain = saved.appendingPathComponent("main.tex")
+        let translated = try String(contentsOf: translatedMain, encoding: .utf8)
+        expectTrue(translated.contains("译文"))
+        expectTrue(translated.contains(#"\cmidrule(lr){1-2}"#))
+        expectTrue(translated.contains(#"\ArxivLensMissingFixture"#))
+        try translated.replacingOccurrences(of: #"\ArxivLensMissingFixture"#, with: "")
+            .write(to: translatedMain, atomically: true, encoding: .utf8)
+
+        let result = try await PaperPipeline.recompile(original, texPath: "", support: support) { progress in
+            expectTrue(progress.title != "翻译论文")
+        }
+        let pdf = try unwrap(PDFDocument(url: result.directory(in: support).appendingPathComponent("chinese.pdf")))
+        expectTrue(pdf.string?.contains("译文") == true)
+        expectNil(PaperPipeline.pendingSource(for: original, in: support))
+        expectTrue(Paper.history(in: support).contains(result))
+        print("VERIFIED compile failure retains translated TeX and recompiles edits locally")
     }
 
     func testLiveArxivThroughMockTranslationAndXeLaTeX() async throws {

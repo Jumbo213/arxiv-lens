@@ -28,9 +28,20 @@ struct TranslationUnit: Sendable {
     let range: NSRange
     let prompt: String
     let tokens: [String]
+    private let followsControlWord: Bool
     private static let marker = try! NSRegularExpression(pattern: #"ZXQ[0-9]{4}QXZ"#)
+    private static let controlWordAtEnd = try! NSRegularExpression(pattern: #"(?<!\\)(?:\\\\)*\\[A-Za-z@]+\z"#)
+
+    init(range: NSRange, prompt: String, tokens: [String], followsControlWord: Bool = false) {
+        self.range = range
+        self.prompt = prompt
+        self.tokens = tokens
+        self.followsControlWord = followsControlWord
+    }
 
     static func marker(_ index: Int) -> String { String(format: "ZXQ%04dQXZ", index) }
+
+    static func endsInControlWord(_ text: String) -> Bool { !controlWordAtEnd.matches(text).isEmpty }
 
     var numericTokens: [Int: String] {
         Dictionary(uniqueKeysWithValues: tokens.enumerated().compactMap { index, value in
@@ -63,10 +74,13 @@ struct TranslationUnit: Sendable {
                 .map { escapes[$0] ?? String($0) }.joined()
         }
         var cursor = 0
-        var result = ""
+        // XeTeX treats Han characters as letters in command names. A space
+        // terminates the control word and is consumed by TeX's tokenizer.
+        var result = followsControlWord ? " " : ""
         for (index, marker) in zip(order, markers) {
             result += prose(NSRange(location: cursor, length: marker.range.location - cursor))
             result += tokens[index]
+            if Self.endsInControlWord(tokens[index]) { result += " " }
             cursor = NSMaxRange(marker.range)
         }
         return result + prose(NSRange(location: cursor, length: input.length - cursor))
@@ -237,6 +251,9 @@ private struct Scanner {
         pattern: #"(?<!\bet al)(?<!\bFig)(?<!\bEq)(?<!\be\.g)(?<!\bi\.e)[.!?](?=[ \t\r\n]+[A-Z])"#
     )
     private static let assignment = try! NSRegularExpression(pattern: #"[ \t]*=[ \t]*[+\-0-9.\\]"#)
+    private static let trimmedRule = try! NSRegularExpression(
+        pattern: #"(?:\s|%[^\r\n]*[\r\n])*(?:\[[^\]]*\](?:\s|%[^\r\n]*[\r\n])*)?\([^)\r\n]*\)(?:\s|%[^\r\n]*[\r\n])*(?=\{)"#
+    )
     private static let unbracedCommands: Set<String> = [
         "vskip", "hskip", "kern", "mkern", "mskip", "penalty", "looseness", "hangindent", "hangafter", "setbox"
     ]
@@ -389,8 +406,14 @@ private struct Scanner {
             flush()
             return newline(after: end)
         }
-        let args = groups(after: end)
-        let last = args.last.map(NSMaxRange) ?? end
+        let argumentStart: Int
+        if name == "cmidrule", let trim = match(Self.trimmedRule, at: end, to: to) {
+            argumentStart = NSMaxRange(trim)
+        } else {
+            argumentStart = end
+        }
+        let args = groups(after: argumentStart)
+        let last = args.last.map(NSMaxRange) ?? argumentStart
         let required = args.filter { text.character(at: $0.location) == 123 }
         if name == "begin", let environment = required.first {
             let env = slice(environment.location + 1, NSMaxRange(environment) - 1)
@@ -480,6 +503,9 @@ private struct Scanner {
             }
         }
         guard prompt.utf16.count <= 12_000 else { return }
-        units.append(TranslationUnit(range: NSRange(location: start, length: end - start), prompt: prompt, tokens: tokens))
+        let followsControlWord = first > 0 && parts[first - 1].1 && NSMaxRange(parts[first - 1].0) == start
+            && TranslationUnit.endsInControlWord(text.substring(with: parts[first - 1].0))
+        units.append(TranslationUnit(range: NSRange(location: start, length: end - start), prompt: prompt, tokens: tokens,
+                                     followsControlWord: followsControlWord))
     }
 }

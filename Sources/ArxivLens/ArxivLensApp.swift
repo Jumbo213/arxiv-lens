@@ -112,7 +112,7 @@ struct LibraryJob: Identifiable {
 
     let id: UUID
     let arxiv: ArxivID
-    let downloadOnly: Bool
+    let kind: String
     var title: String
     var progress = JobProgress(title: "等待开始", detail: "", fraction: 0)
     var phase = Phase.queued
@@ -131,11 +131,28 @@ struct LibraryJob: Identifiable {
 
 @MainActor
 final class LibraryStore: ObservableObject {
+    private enum Work {
+        case download, translate(TranslationSettings), compile(texPath: String)
+
+        var translating: Bool {
+            if case .translate = self { return true }
+            return false
+        }
+
+        var label: String {
+            switch self {
+            case .download: return "下载"
+            case .translate: return "翻译"
+            case .compile: return "编译"
+            }
+        }
+    }
+
     private struct Request {
         let id: UUID
         let arxiv: ArxivID
         let paper: Paper?
-        let settings: TranslationSettings?
+        let work: Work
     }
 
     private struct Running {
@@ -179,20 +196,28 @@ final class LibraryStore: ObservableObject {
         catch { failure = JobFailure(message: error.localizedDescription); return }
         guard !isBusy(arxiv.paperID) else { return }
 
-        let settings: TranslationSettings?
+        let work: Work
         if downloadOnly {
-            settings = nil
+            work = .download
         } else {
             guard let configured = apiSettings() else { return }
-            settings = configured
+            work = .translate(configured)
         }
+        enqueue(arxiv, paper: paper, work: work)
+        if paper == nil { input = "" }
+    }
 
+    func recompile(_ paper: Paper) {
+        guard let arxiv = try? ArxivID(paper.arxivID), !isBusy(arxiv.paperID) else { return }
+        enqueue(arxiv, paper: paper, work: .compile(texPath: UserDefaults.standard.string(forKey: "texPath") ?? ""))
+    }
+
+    private func enqueue(_ arxiv: ArxivID, paper: Paper?, work: Work) {
         let id = UUID()
         jobs.removeAll { $0.arxiv.paperID == arxiv.paperID && $0.failure != nil }
-        jobs.append(LibraryJob(id: id, arxiv: arxiv, downloadOnly: downloadOnly, title: paper?.title ?? arxiv.value))
-        pending.append(Request(id: id, arxiv: arxiv, paper: paper, settings: settings))
+        jobs.append(LibraryJob(id: id, arxiv: arxiv, kind: work.label, title: paper?.title ?? arxiv.value, original: paper))
+        pending.append(Request(id: id, arxiv: arxiv, paper: paper, work: work))
         if let paper, selected?.id == paper.id { readerFollowingJob = id }
-        if paper == nil { input = "" }
         startPending()
     }
 
@@ -200,14 +225,14 @@ final class LibraryStore: ObservableObject {
         while running.count < 3 {
             // Leave a slot available for downloading while two long translations run.
             let canTranslate = running.values.filter(\.translating).count < 2
-            guard let index = pending.firstIndex(where: { $0.settings == nil || canTranslate }) else { return }
+            guard let index = pending.firstIndex(where: { !$0.work.translating || canTranslate }) else { return }
             let request = pending.remove(at: index)
             editJob(request.id) { $0.phase = .running }
             let task = Task { [weak self] in
                 guard let self else { return }
                 await perform(request)
             }
-            running[request.id] = Running(task: task, translating: request.settings != nil)
+            running[request.id] = Running(task: task, translating: request.work.translating)
         }
     }
 
@@ -226,25 +251,40 @@ final class LibraryStore: ObservableObject {
         }
         do {
             let result: Paper
-            if let settings = request.settings {
+            switch request.work {
+            case .translate(let settings):
                 result = try await PaperPipeline.run(input: request.arxiv.value, settings: settings,
                                                      savedPaper: request.paper, originalReady: originalReady, report: report)
-            } else {
+            case .download:
                 result = try await PaperPipeline.download(input: request.arxiv.value, originalReady: originalReady,
                                                           report: report)
+            case .compile(let texPath):
+                guard let paper = request.paper else { throw LensError("缺少需要编译的论文。") }
+                result = try await PaperPipeline.recompile(paper, texPath: texPath, report: report)
             }
             papers = Paper.history()
             if selected == nil || readerFollowingJob == id {
-                select(result, original: request.settings == nil)
+                select(result, original: !result.hasTranslation)
             }
             jobs.removeAll { $0.id == id }
-            if !Task.isCancelled { autoClassify(result, settings: request.settings) }
+            if !Task.isCancelled {
+                switch request.work {
+                case .translate(let settings): autoClassify(result, settings: settings)
+                case .download: autoClassify(result, settings: nil)
+                case .compile: break
+                }
+            }
         } catch {
             if Task.isCancelled {
                 jobs.removeAll { $0.id == id }
             } else {
                 editJob(id) { job in
-                    let saved = job.original == nil ? "" : "原版 PDF 已保存在左侧文献库。\n\n"
+                    let saved: String
+                    if let original = job.original, PaperPipeline.pendingSource(for: original) != nil {
+                        saved = "译后 TeX 已保存。可以直接重新编译，或在访达中编辑译稿后再编译。\n\n"
+                    } else {
+                        saved = job.original == nil ? "" : "原版 PDF 已保存在左侧文献库。\n\n"
+                    }
                     let log = (error as? PaperPipeline.CompileFailure)?.logURL
                     job.phase = .failed(JobFailure(message: "\(job.title)\n\n" + saved + error.localizedDescription,
                                                    logURL: log))

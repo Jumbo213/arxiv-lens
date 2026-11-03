@@ -289,7 +289,12 @@ struct LibrarySidebar: View {
         .accessibilityAddTraits(active ? .isSelected : [])
         .help(paper.title)
         .contextMenu {
-            Button(paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文") {
+            let canRecompile = PaperPipeline.pendingSource(for: paper) != nil
+            if canRecompile {
+                Button("重新编译") { store.recompile(paper) }.disabled(store.isBusy(entry.id))
+            }
+            let translationLabel = paper.hasTranslation ? "重新翻译这篇论文" : "翻译这篇论文"
+            Button(canRecompile ? "重新翻译（调用 API）" : translationLabel) {
                 store.start(paper: paper)
             }.disabled(store.isBusy(entry.id))
             Button("编辑分类…") { editTarget = entry }.disabled(catalog.loadError != nil)

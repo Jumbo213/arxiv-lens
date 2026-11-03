@@ -9,6 +9,40 @@ public enum PaperPipeline {
         public var errorDescription: String? { message }
     }
 
+    private struct Draft: Codable, Sendable {
+        let paper: Paper
+        let originalID: UUID
+        let rootPath: String
+    }
+
+    public static func pendingSource(for paper: Paper) -> URL? {
+        pendingSource(for: paper, in: Paper.support)
+    }
+
+    static func pendingSource(for paper: Paper, in support: URL) -> URL? {
+        drafts(for: paper, in: support).first?.folder.appendingPathComponent("source", isDirectory: true)
+    }
+
+    public static func recompile(
+        _ paper: Paper, texPath: String, report: @Sendable (JobProgress) async -> Void
+    ) async throws -> Paper {
+        try await recompile(paper, texPath: texPath, support: Paper.support, report: report)
+    }
+
+    static func recompile(
+        _ paper: Paper, texPath: String, support: URL, report: @Sendable (JobProgress) async -> Void
+    ) async throws -> Paper {
+        guard let saved = drafts(for: paper, in: support).first else {
+            throw LensError("找不到这篇论文的待编译译稿。")
+        }
+        let workspace = support.appendingPathComponent("Jobs/\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        await report(JobProgress("检查本机 TeX", "读取已保存的译稿", 0.15))
+        let bin = URL(fileURLWithPath: try await LocalTeX.check(texPath), isDirectory: true)
+        return try await compile(saved.draft, from: saved.folder, original: paper, support: support,
+                                 workspace: workspace, bin: bin, report: report)
+    }
+
     public static func run(
         input: String, settings: TranslationSettings, savedPaper: Paper? = nil,
         originalReady: @Sendable (Paper) async -> Void = { _ in },
@@ -49,9 +83,7 @@ public enum PaperPipeline {
 
         let id = UUID()
         let workspace = support.appendingPathComponent("Jobs/\(id.uuidString)", isDirectory: true)
-        let result = workspace.appendingPathComponent("result", isDirectory: true)
-        let original = result.appendingPathComponent("original.pdf")
-        try fm.createDirectory(at: result, withIntermediateDirectories: true)
+        try fm.createDirectory(at: workspace, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: workspace) }
 
         let originalPaper: Paper
@@ -105,8 +137,7 @@ public enum PaperPipeline {
 
         await report(JobProgress("检查本机 TeX", "确认 XeLaTeX、latexmk 和中文排版组件", 0.25))
         let bin = URL(fileURLWithPath: try await LocalTeX.check(settings.texPath), isDirectory: true)
-        let source = result.appendingPathComponent("source", isDirectory: true)
-        try fm.copyItem(at: originalPaper.directory(in: support).appendingPathComponent("original.pdf"), to: original)
+        let source = workspace.appendingPathComponent("source", isDirectory: true)
         try fm.copyItem(at: originalSource, to: source)
         let project = try TeXProject.read(from: source)
         let title = metadata.title ?? project.title ?? originalPaper.title
@@ -178,30 +209,96 @@ public enum PaperPipeline {
         }
         guard untranslated < count else { throw LensError("模型未返回可用的中文译文。请检查模型和接口。") }
 
+        let paper = Paper(id: id, arxivID: arxiv.value, title: title, completedAt: .now,
+                          untranslated: untranslated, metadata: metadata.details ?? cached?.metadata)
+        let sourceRoot = source.resolvingSymlinksInPath().path + "/"
+        guard project.root.path.hasPrefix(sourceRoot) else { throw LensError("无法定位译稿中的主 TeX 文件。") }
+        let draft = Draft(paper: paper, originalID: originalPaper.id,
+                          rootPath: String(project.root.path.dropFirst(sourceRoot.count)))
+        let folder = try save(draft, from: source, workspace: workspace, support: support)
+        return try await compile(draft, from: folder, original: originalPaper, support: support,
+                                 workspace: workspace, bin: bin, report: report)
+    }
+
+    private static func draftDirectory(for paper: Paper, in support: URL) -> URL {
+        let version = paper.arxivID.lowercased().replacingOccurrences(of: "/", with: "_")
+        return support.appendingPathComponent("TranslationDrafts/\(version)", isDirectory: true)
+    }
+
+    private static func drafts(for paper: Paper, in support: URL) -> [(draft: Draft, folder: URL)] {
+        guard let arxiv = try? ArxivID(paper.arxivID) else { return [] }
+        let fm = FileManager.default
+        let directories = (try? fm.contentsOfDirectory(at: draftDirectory(for: paper, in: support),
+                                                        includingPropertiesForKeys: nil)) ?? []
+        return directories.compactMap { folder -> (draft: Draft, folder: URL)? in
+            guard let data = try? Data(contentsOf: folder.appendingPathComponent("draft.json")),
+                  let draft = try? JSONDecoder().decode(Draft.self, from: data),
+                  draft.paper.id.uuidString == folder.lastPathComponent,
+                  draft.paper.arxivID == paper.arxivID,
+                  arxiv.isVersioned || draft.originalID == paper.id,
+                  !fm.fileExists(atPath: draft.paper.directory(in: support).appendingPathComponent("chinese.pdf").path),
+                  fm.fileExists(atPath: folder.appendingPathComponent("source").path) else { return nil }
+            return (draft, folder)
+        }.sorted { $0.draft.paper.completedAt > $1.draft.paper.completedAt }
+    }
+
+    private static func save(_ draft: Draft, from source: URL, workspace: URL, support: URL) throws -> URL {
+        let fm = FileManager.default
+        let staging = workspace.appendingPathComponent("draft", isDirectory: true)
+        let parent = draftDirectory(for: draft.paper, in: support)
+        let destination = parent.appendingPathComponent(draft.paper.id.uuidString, isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: false)
+        try fm.moveItem(at: source, to: staging.appendingPathComponent("source", isDirectory: true))
+        try JSONEncoder().encode(draft).write(to: staging.appendingPathComponent("draft.json"), options: .atomic)
+        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        try fm.moveItem(at: staging, to: destination)
+        return destination
+    }
+
+    private static func compile(
+        _ draft: Draft, from folder: URL, original: Paper, support: URL, workspace: URL, bin: URL,
+        report: @Sendable (JobProgress) async -> Void
+    ) async throws -> Paper {
+        try Task.checkCancellation()
+        let fm = FileManager.default
+        let result = workspace.appendingPathComponent("result", isDirectory: true)
+        let source = result.appendingPathComponent("source", isDirectory: true)
+        try fm.createDirectory(at: result, withIntermediateDirectories: true)
+        try fm.copyItem(at: folder.appendingPathComponent("source", isDirectory: true), to: source)
+        let root = source.appendingPathComponent(draft.rootPath).resolvingSymlinksInPath()
+        guard root.path.hasPrefix(source.resolvingSymlinksInPath().path + "/"), fm.fileExists(atPath: root.path) else {
+            throw LensError("找不到译稿中的主 TeX 文件 \(draft.rootPath)。")
+        }
+        try fm.copyItem(at: original.directory(in: support).appendingPathComponent("original.pdf"),
+                        to: result.appendingPathComponent("original.pdf"))
         await report(JobProgress("本机编译中文版", "保留论文模板、图表、公式和交叉引用", 0.88))
         let log = result.appendingPathComponent("compile.log")
         let compiled: URL
         do {
-            compiled = try await LocalTeX.compile(root: project.root, workspace: workspace, bin: bin, log: log)
+            compiled = try await LocalTeX.compile(root: root, workspace: workspace, bin: bin, log: log)
+            guard let translatedPDF = PDFDocument(url: compiled), translatedPDF.pageCount > 0 else {
+                throw LensError("XeLaTeX 没有生成可读的 PDF。")
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             let logs = support.appendingPathComponent("CompileLogs", isDirectory: true)
-            let failure = logs.appendingPathComponent(id.uuidString + ".log")
+            let failure = logs.appendingPathComponent(workspace.lastPathComponent + ".log")
             try? fm.createDirectory(at: logs, withIntermediateDirectories: true)
             try? fm.moveItem(at: log, to: failure)
             throw CompileFailure(message: error.localizedDescription,
                                  logURL: fm.fileExists(atPath: failure.path) ? failure : nil)
         }
-        guard let translatedPDF = PDFDocument(url: compiled), translatedPDF.pageCount > 0 else {
-            throw LensError("XeLaTeX 没有生成可读的 PDF。")
-        }
         try fm.copyItem(at: compiled, to: result.appendingPathComponent("chinese.pdf"))
-        let paper = Paper(id: id, arxivID: arxiv.value, title: title, completedAt: .now,
-                          untranslated: untranslated, metadata: metadata.details ?? cached?.metadata)
+        let paper = Paper(id: draft.paper.id, arxivID: draft.paper.arxivID, title: draft.paper.title, completedAt: .now,
+                          untranslated: draft.paper.untranslated, metadata: draft.paper.metadata)
         try Task.checkCancellation()
         try publish(paper, from: result, in: support)
-        await report(JobProgress("已加入文献库", title, 1))
+        for previous in drafts(for: original, in: support) where previous.draft.paper.completedAt <= draft.paper.completedAt {
+            try? fm.removeItem(at: previous.folder)
+        }
+        try? fm.removeItem(at: folder)
+        await report(JobProgress("已加入文献库", paper.title, 1))
         return paper
     }
 
