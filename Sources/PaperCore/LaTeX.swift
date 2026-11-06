@@ -5,6 +5,9 @@ private let documentEnd = try! NSRegularExpression(pattern: #"\\end\s*\{\s*docum
 private let documentClass = try! NSRegularExpression(pattern: #"\\documentclass\s*(?:\[[^\]]*\]\s*)?\{([^{}]+)\}"#)
 private let titleCommand = try! NSRegularExpression(pattern: #"\\(?:title|subtitle|shorttitle)\s*(?:\[[^\]]*\]\s*)?\{"#)
 private let abstractCommand = try! NSRegularExpression(pattern: #"\\abstract\s*\{"#)
+private let abstractEnvironment = try! NSRegularExpression(
+    pattern: #"(?<!\\)\\begin\s*\{\s*abstract\s*\}([\s\S]*?)\\end\s*\{\s*abstract\s*\}"#
+)
 private let include = try! NSRegularExpression(pattern: #"\\(?:input|include|subfile|subfileinclude)\s*\{\s*([^{}\s]+)\s*\}|\\input[ \t]+([\w./-]+)"#)
 private let imports = try! NSRegularExpression(pattern: #"\\(?:subimport|import|inputfrom|includefrom|subinputfrom|subincludefrom)\s*\{([^{}]*)\}\s*\{([^{}]+)\}"#)
 private let comments = try! NSRegularExpression(pattern: #"(?<!\\)(?:\\\\)*(%[^\r\n]*)"#)
@@ -30,6 +33,7 @@ struct TranslationUnit: Sendable {
     let tokens: [String]
     private let followsControlWord: Bool
     private static let marker = try! NSRegularExpression(pattern: #"ZXQ[0-9]{4}QXZ"#)
+    private static let prose = try! NSRegularExpression(pattern: #"[A-Za-z]{2,}"#)
     private static let controlWordAtEnd = try! NSRegularExpression(pattern: #"(?<!\\)(?:\\\\)*\\[A-Za-z@]+\z"#)
 
     init(range: NSRange, prompt: String, tokens: [String], followsControlWord: Bool = false) {
@@ -48,6 +52,22 @@ struct TranslationUnit: Sendable {
             .split(separator: "\u{001F}")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    var unlockedProse: [NSRange] {
+        let input = prompt as NSString
+        let markers = Self.marker.matches(prompt).map(\.range)
+        let starts = [0] + markers.map(NSMaxRange)
+        let ends = markers.map(\.location) + [input.length]
+        return zip(starts, ends).compactMap { start, end in
+            let span = NSRange(location: start, length: end - start)
+            let raw = input.substring(with: span)
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard Self.prose.firstMatch(in: trimmed, range: NSRange(location: 0, length: trimmed.utf16.count)) != nil else {
+                return nil
+            }
+            return input.range(of: trimmed, options: .literal, range: span)
+        }
     }
 
     var numericTokens: [Int: String] {
@@ -266,6 +286,11 @@ struct TeXProject {
                         }
                         scanner.scan(from: body.location, to: NSMaxRange(body), sentenceUnits: isAbstract)
                     }
+                }
+                let preamble = NSRange(location: 0, length: start.location)
+                for match in abstractEnvironment.matches(in: clean, range: preamble) {
+                    let body = match.range(at: 1)
+                    scanner.scan(from: body.location, to: NSMaxRange(body), sentenceUnits: true)
                 }
             }
             let bodyStart = start.map(NSMaxRange) ?? 0

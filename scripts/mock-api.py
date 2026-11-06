@@ -48,6 +48,17 @@ class Handler(BaseHTTPRequestHandler):
                         for row in payload["documents"] if "Attention" in row["title"]]
                 rows.append({"id": "not-in-library", "score": 99, "reason": "无效编号"})
                 answer = {"matches": rows}
+            elif request["model"] == "fixture-locked-tokens":
+                answer = {}
+                for index, excerpt in payload["excerpts"].items():
+                    if payload.get("source_sentence"):
+                        answer[index] = "补译 " + excerpt
+                    elif excerpt.startswith("A locked excerpt"):
+                        answer[index] = "引用缺失。" if payload["strict_marker_check_retry"] else None
+                    elif excerpt.startswith("This is a paragraph") and not payload["strict_marker_check_retry"]:
+                        answer[index] = "初次译文 " + excerpt
+                    else:
+                        answer[index] = "译文 " + excerpt
             else:
                 answer = {index: "译文 " + text for index, text in payload["excerpts"].items()}
             content = json.dumps(answer, ensure_ascii=False)

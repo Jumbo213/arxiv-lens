@@ -71,6 +71,7 @@ struct PaperCoreTests {
         let command = TranslationUnit(range: NSRange(location: 0, length: 2), prompt: "A ZXQ0000QXZ concept.",
                                       tokens: [#"~\Target"#])
         expectEqual(command.restore("将ZXQ0000QXZ中的概念归组。"), #"将~\Target 中的概念归组。"#)
+        expectEqual(unit.unlockedProse.map { (unit.prompt as NSString).substring(with: $0) }, ["See", "and"])
     }
 
     func testHistoryGroups() {
@@ -225,6 +226,10 @@ struct PaperCoreTests {
         \documentclass{article}
         \title{Important Results}
         \author{Alice Author}
+        % \begin{abstract} This example in a comment should be ignored. \end{abstract}
+        \begin {abstract}
+        A preamble summary cites \cite{x}. Its second sentence describes the evidence.
+        \end {abstract}
         \begin{document}
         \maketitle
         \begin{abstract}
@@ -256,7 +261,10 @@ struct PaperCoreTests {
         expectEqual(project.root.path, root.resolvingSymlinksInPath().path)
         expectEqual(project.title, "Important Results")
         expectEqual(project.drafts.count, 2)
-        expectEqual(project.drafts[0].units.map(\.prompt), ["Important Results", "We achieve ZXQ0000QXZ points.", "This result is significant.", "Short Title", "Full Title"])
+        expectEqual(project.drafts[0].units.map(\.prompt), [
+            "Important Results", "A preamble summary cites ZXQ0000QXZ.", "Its second sentence describes the evidence.",
+            "We achieve ZXQ0000QXZ points.", "This result is significant.", "Short Title", "Full Title"
+        ])
         let units = project.drafts[1].units
         expectEqual(units.count, 6)
         expectTrue(units.allSatisfy { !$0.prompt.contains("lr") })
@@ -269,6 +277,7 @@ struct PaperCoreTests {
         let output = try String(contentsOf: root, encoding: .utf8)
         expectTrue(output.contains(#"\title{示例 Important Results}"#))
         expectTrue(output.contains(#"\author{Alice Author}"#))
+        expectTrue(output.contains(#"示例 A preamble summary cites \cite{x}. 示例 Its second sentence describes the evidence."#))
         expectTrue(output.contains(#"\bibitem{x} Example Work."#))
         expectTrue(output.contains(#"\usepackage{xeCJK}"#))
         expectTrue(output.contains(#"\vskip 0.15in"#))
@@ -380,6 +389,7 @@ struct PaperCoreTests {
         \newcommand{\Target}{Target}
         \begin{document}
         This is a paragraph that can be translated.
+        A locked excerpt references \(x_i\) and \(y_i\) in that order.
         \Target-concepts are described here.
         \begin{tabular}{ll}
         First & Header \\
@@ -390,7 +400,7 @@ struct PaperCoreTests {
         \end{document}
         """#.write(to: main, atomically: true, encoding: .utf8)
 
-        let settings = try TranslationSettings(url: endpoint, model: "mock", key: "")
+        let settings = try TranslationSettings(url: endpoint, model: "fixture-locked-tokens", key: "")
         do {
             _ = try await PaperPipeline.run(input: original.arxivID, settings: settings, support: support,
                                             savedPaper: original) { _ in }
@@ -405,6 +415,8 @@ struct PaperCoreTests {
         let translatedMain = saved.appendingPathComponent("main.tex")
         let translated = try String(contentsOf: translatedMain, encoding: .utf8)
         expectTrue(translated.contains("译文"))
+        expectTrue(translated.contains("初次译文 This is a paragraph"))
+        expectTrue(translated.contains(#"补译 A locked excerpt references \(x_i\) 补译 and \(y_i\) 补译 in that order."#))
         expectTrue(translated.contains(#"\cmidrule(lr){1-2}"#))
         expectTrue(translated.contains(#"\ArxivLensMissingFixture"#))
         try translated.replacingOccurrences(of: #"\ArxivLensMissingFixture"#, with: "")
@@ -415,6 +427,7 @@ struct PaperCoreTests {
         }
         let pdf = try unwrap(PDFDocument(url: result.directory(in: support).appendingPathComponent("chinese.pdf")))
         expectTrue(pdf.string?.contains("译文") == true)
+        expectEqual(result.untranslated, 0)
         expectNil(PaperPipeline.pendingSource(for: original, in: support))
         expectTrue(Paper.history(in: support).contains(result))
         print("VERIFIED compile failure retains translated TeX and recompiles edits locally")

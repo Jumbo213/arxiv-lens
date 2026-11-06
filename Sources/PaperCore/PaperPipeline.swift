@@ -184,6 +184,10 @@ public enum PaperPipeline {
                         for index in failed where replies[index] == nil {
                             replies[index] = try await api.translate([missing[index]][...], title: title,
                                                                      context: "", retry: true).first ?? nil
+                            if replies[index] == nil {
+                                replies[index] = try await api.translateWithLockedTokens(missing[index], title: title,
+                                                                                       context: context)
+                            }
                         }
                     }
                     var next = 0
